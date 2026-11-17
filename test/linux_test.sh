@@ -92,6 +92,54 @@ start_mock 8706
 agent 8706 ANTHROPIC_API_KEY=sk-test-good SCREEN_AGENT_TASK=test > /tmp/out6.txt 2>&1; echo "exit=$?"
 grep -q "Stopped (mouse in top-left corner)" /tmp/out6.txt && pass "failsafe stopped the task" || fail "failsafe"
 python3 -c 'import json; r=json.load(open("/tmp/report_8706.json")); print("mock calls:", r["calls"], "done:", r["done"])'
+# put the cursor back in the middle so later tests don't trip the failsafe
+python3 -c '
+import ctypes
+X=ctypes.CDLL("libX11.so.6"); T=ctypes.CDLL("libXtst.so.6")
+X.XOpenDisplay.restype=ctypes.c_void_p; X.XOpenDisplay.argtypes=[ctypes.c_char_p]; d=X.XOpenDisplay(None)
+T.XTestFakeMotionEvent.argtypes=[ctypes.c_void_p,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_ulong]
+T.XTestFakeMotionEvent(d,0,960,540,0); X.XSync.argtypes=[ctypes.c_void_p,ctypes.c_int]; X.XSync(d,0)'
+
+ws_is() {  # $1 port $2 expected workspace
+  python3 -c 'import json,sys; r=json.load(open("/tmp/report_%s.json"%sys.argv[1])); print("report workspace:", r["workspace"]); sys.exit(0 if r["workspace"]==sys.argv[2] else 1)' "$1" "$2"
+}
+
+echo "=== 9. organization-wide key, workspace list -> pick 2"
+start_mock 8707 MOCK_UNSCOPED=1
+mkdir -p /tmp/h9
+printf '2\n' | agent 8707 HOME=/tmp/h9 ANTHROPIC_API_KEY=sk-test-good SCREEN_AGENT_TASK=test SCREEN_AGENT_DRY_RUN=1 > /tmp/out9.txt 2>&1; echo "exit=$?"
+grep -E "several workspaces|^  [0-9]\)|Saved workspace|Using workspace" /tmp/out9.txt
+grep -q "TESTARCHIVED" /tmp/out9.txt && fail "archived workspace was listed" || pass "archived workspace not listed"
+report_ok 8707 "unscoped key, picked workspace 2" || FAIL=1
+ws_is 8707 wrkspc_01TESTSECOND && pass "requests carried wrkspc_01TESTSECOND" || fail "workspace header"
+[ "$(cat /tmp/h9/.screen-agent/workspace)" = wrkspc_01TESTSECOND ] && [ "$(stat -c %a /tmp/h9/.screen-agent/workspace)" = 600 ] \
+  && pass "workspace saved, mode 600" || fail "workspace file"
+
+echo "=== 10. organization-wide key, list forbidden -> paste (bad, then good)"
+start_mock 8708 MOCK_UNSCOPED=nolist
+mkdir -p /tmp/h10
+printf 'wrkspc_01NOPE\nwrkspc_01TESTDEFAULT\n' | agent 8708 HOME=/tmp/h10 ANTHROPIC_API_KEY=sk-test-good SCREEN_AGENT_TASK=test SCREEN_AGENT_DRY_RUN=1 > /tmp/out10.txt 2>&1; echo "exit=$?"
+grep -E "across your organization|didn't work|Saved workspace" /tmp/out10.txt
+grep -q "That workspace didn't work" /tmp/out10.txt && pass "bad workspace rejected" || fail "bad workspace message"
+report_ok 8708 "unscoped key, pasted workspace" || FAIL=1
+ws_is 8708 wrkspc_01TESTDEFAULT && pass "requests carried wrkspc_01TESTDEFAULT" || fail "workspace header"
+[ "$(stat -c %a /tmp/h10/.screen-agent/workspace)" = 600 ] && pass "workspace saved, mode 600" || fail "workspace file mode"
+
+echo "=== 11. ANTHROPIC_WORKSPACE_ID env -> no prompt"
+start_mock 8709 MOCK_UNSCOPED=1
+mkdir -p /tmp/h11
+agent 8709 HOME=/tmp/h11 ANTHROPIC_API_KEY=sk-test-good ANTHROPIC_WORKSPACE_ID=wrkspc_01TESTSECOND SCREEN_AGENT_TASK=test SCREEN_AGENT_DRY_RUN=1 < /dev/null > /tmp/out11.txt 2>&1; echo "exit=$?"
+grep -qE "Number:|Paste the workspace ID" /tmp/out11.txt && fail "prompted for workspace" || pass "no workspace prompt"
+report_ok 8709 "env workspace" || FAIL=1
+ws_is 8709 wrkspc_01TESTSECOND && pass "requests carried env workspace" || fail "workspace header"
+
+echo "=== 12. first-run key prompt with an organization-wide key"
+start_mock 8710 MOCK_UNSCOPED=1
+mkdir -p /tmp/h12
+printf 'sk-test-good\n1\n' | agent 8710 HOME=/tmp/h12 SCREEN_AGENT_TASK=test SCREEN_AGENT_DRY_RUN=1 > /tmp/out12.txt 2>&1; echo "exit=$?"
+grep -qE "rejected|Couldn't check" /tmp/out12.txt && fail "workspace-400 treated as a bad key" || pass "workspace-400 accepted as a good key"
+report_ok 8710 "first-run org key" || FAIL=1
+ws_is 8710 wrkspc_01TESTDEFAULT && pass "picked workspace 1" || fail "workspace header"
 
 echo
 [ $FAIL = 0 ] && echo "ALL LINUX TESTS PASSED" || echo "SOME LINUX TESTS FAILED"

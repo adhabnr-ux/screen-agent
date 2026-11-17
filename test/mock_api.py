@@ -10,6 +10,9 @@ Writes a JSON report to $MOCK_REPORT (default ./mock_report.json) after each req
 Options via env:
   MOCK_REJECT_BETA=1   reply 400 to any request carrying anthropic-beta (tests compat mode)
   MOCK_429_FIRST=1     reply 429 (retry-after: 1) to the first /v1/messages call
+  MOCK_UNSCOPED=1      the key is organization-wide: requests need anthropic-workspace-id
+                       (wrkspc_01TESTDEFAULT or wrkspc_01TESTSECOND); /v1/organizations/workspaces lists both
+  MOCK_UNSCOPED=nolist same, but listing workspaces returns 403 (user must paste the ID)
 """
 import argparse
 import base64
@@ -20,8 +23,16 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 GOOD_KEY = "sk-test-good"
+UNSCOPED = os.environ.get("MOCK_UNSCOPED", "")
+WORKSPACES = [{"id": "wrkspc_01TESTDEFAULT", "type": "workspace", "name": "Default Workspace", "archived_at": None},
+              {"id": "wrkspc_01TESTSECOND", "type": "workspace", "name": "Research", "archived_at": None},
+              {"id": "wrkspc_01TESTARCHIVED", "type": "workspace", "name": "Old", "archived_at": "2026-01-01T00:00:00Z"}]
+LIVE_IDS = [w["id"] for w in WORKSPACES if not w["archived_at"]]
+NEED_WS = {"type": "error", "error": {"type": "invalid_request_error", "message":
+           "This API key is not scoped to a workspace, so this request must include the anthropic-workspace-id "
+           "header with the ID of the workspace to use. Add the header, or use an API key that is scoped to a workspace."}}
 REPORT = os.environ.get("MOCK_REPORT", "mock_report.json")
-state = {"calls": 0, "step": 0, "errors": [], "checks": [], "saw_429": False,
+state = {"workspace_seen": None, "calls": 0, "step": 0, "errors": [], "checks": [], "saw_429": False,
          "compat": False, "done": False, "image_sizes": []}
 
 
@@ -183,9 +194,31 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def workspace_problem(self):
+        """None if the workspace header is fine for this key, else (code, body) to send."""
+        ws = self.headers.get("anthropic-workspace-id")
+        if not UNSCOPED:
+            return None
+        if not ws:
+            return 400, NEED_WS
+        if ws not in LIVE_IDS:
+            return 404, {"type": "error", "error": {"type": "not_found_error", "message": f"Workspace {ws} not found."}}
+        state["workspace_seen"] = ws
+        return None
+
     def do_GET(self):
+        if self.path.startswith("/v1/organizations/workspaces"):
+            if self.headers.get("x-api-key") != GOOD_KEY:
+                return self.send(401, {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}})
+            if UNSCOPED == "nolist":
+                return self.send(403, {"type": "error", "error": {"type": "permission_error", "message": "Your account does not have permission to list workspaces."}})
+            data = WORKSPACES if "include_default=true" in self.path else WORKSPACES[1:]
+            return self.send(200, {"data": data, "has_more": False, "first_id": data[0]["id"], "last_id": data[-1]["id"]})
         if self.path.startswith("/v1/models"):
             if self.headers.get("x-api-key") == GOOD_KEY:
+                wp = self.workspace_problem()
+                if wp:
+                    return self.send(*wp)
                 return self.send(200, {"data": [{"id": "claude-opus-5-5"}]})
             return self.send(401, {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}})
         self.send(404, {})
@@ -213,6 +246,11 @@ class H(BaseHTTPRequestHandler):
         if os.environ.get("MOCK_REJECT_BETA"):
             state["compat"] = True
             check("fallbacks" not in body, "compat mode drops fallbacks")
+        wp = self.workspace_problem()
+        if wp:
+            check(False, "messages request without a valid anthropic-workspace-id for an unscoped key")
+            write_report()
+            return self.send(*wp)
         msgs = validate(body, hdrs)
         if state["step"] > 0:
             check_results(msgs)
@@ -230,7 +268,7 @@ def write_report():
     with open(REPORT, "w") as f:
         json.dump({"done": state["done"], "calls": state["calls"], "errors": state["errors"],
                    "passed": len(state["checks"]), "saw_429": state["saw_429"],
-                   "compat": state["compat"], "image_sizes": state["image_sizes"]}, f, indent=1)
+                   "compat": state["compat"], "workspace": state["workspace_seen"], "image_sizes": state["image_sizes"]}, f, indent=1)
 
 
 if __name__ == "__main__":

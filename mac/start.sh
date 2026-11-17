@@ -9,11 +9,16 @@ umask 077
 mkdir -p "$DIR/tmp"
 printf '\033]0;Screen Agent\007'
 
-# Prints the HTTP status of GET /v1/models with key $1. The key goes through a pipe, never the command line.
+# Sets KEY_CODE (HTTP status) and KEY_BODY for GET /v1/models with key $1.
+# The key goes through a pipe, never the command line.
 check_key() {
-  curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 \
-    -K <(printf 'header = "x-api-key: %s"\nheader = "anthropic-version: 2026-10-21"\n' "$1") \
-    "$BASE/v1/models?limit=1" 2>/dev/null
+  local out ws=""
+  [ -n "${ANTHROPIC_WORKSPACE_ID:-}" ] && ws="header = \"anthropic-workspace-id: $ANTHROPIC_WORKSPACE_ID\""
+  out="$(curl -sS -w '\n%{http_code}' --connect-timeout 15 --max-time 30 \
+    -K <(printf 'header = "x-api-key: %s"\nheader = "anthropic-version: 2026-10-21"\n%s\n' "$1" "$ws") \
+    "$BASE/v1/models?limit=1" 2>/dev/null)"
+  KEY_CODE="${out##*$'\n'}"
+  KEY_BODY="${out%$'\n'*}"
 }
 
 get_key() {
@@ -27,11 +32,15 @@ get_key() {
     KEY="$(printf '%s' "$KEY" | tr -d '[:space:]')"
     [ -z "$KEY" ] && continue
     case "$KEY" in *[!A-Za-z0-9_-]*) echo "That doesn't look like an API key. Try again."; continue ;; esac
-    code="$(check_key "$KEY")"
-    case "$code" in
+    check_key "$KEY"
+    case "$KEY_CODE" in
       200) echo "Key works."; break ;;
+      400) case "$KEY_BODY" in
+             *workspace*) echo "Key works. It covers your whole organization, so you'll pick a workspace next."; break ;;
+             *) echo "The API didn't accept that key: $KEY_BODY" ;;
+           esac ;;
       401|403) echo "That key was rejected. Check it and try again." ;;
-      *) echo "Couldn't reach the API to check the key (HTTP ${code:-none}). Saving it anyway."; break ;;
+      *) echo "Couldn't reach the API to check the key (HTTP ${KEY_CODE:-none}). Saving it anyway."; break ;;
     esac
   done
   printf '%s' "$KEY" > "$KEYF"
@@ -42,8 +51,8 @@ while true; do
   get_key
   SCREEN_AGENT_KEY="$KEY" /usr/bin/osascript -l JavaScript "$DIR/agent.js"
   rc=$?
-  if [ "$rc" = 3 ]; then # /key: forget the key and ask again
-    rm -f "$KEYF"; USE_ENV_KEY=0; KEY=""
+  if [ "$rc" = 3 ]; then # /key: forget the key (and its workspace) and ask again
+    rm -f "$KEYF" "$DIR/workspace"; USE_ENV_KEY=0; KEY=""
     echo "Forgot the saved key."
     continue
   fi

@@ -25,6 +25,7 @@ EFFORT = os.environ.get("SCREEN_AGENT_EFFORT", "medium")
 DRY_RUN = os.environ.get("SCREEN_AGENT_DRY_RUN") == "1"
 TASK = os.environ.get("SCREEN_AGENT_TASK")
 KEY_PATH = os.path.expanduser("~/.screen-agent/key")
+WS_PATH = os.path.expanduser("~/.screen-agent/workspace")
 API_VERSION = "2026-10-21"
 BETAS = "server-side-fallback-2026-07-01,thinking-display-updates-2026-08-18"
 RETRY_CODES = (429, 500, 502, 503, 504, 529)
@@ -497,28 +498,79 @@ def png(w, h, raw):
             chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
-# --------------------------------------------------------------------------- API key
+# --------------------------------------------------------------------------- API key + workspace
 
-def check_key(key):
-    req = urllib.request.Request(BASE + "/v1/models?limit=1",
-                                 headers={"x-api-key": key, "anthropic-version": API_VERSION})
+WORKSPACE = {"id": None}  # anthropic-workspace-id for organization-wide keys
+WS_RE = re.compile(r"^wrkspc_[A-Za-z0-9]+$")
+
+
+def auth_headers(key, workspace=True):
+    h = {"x-api-key": key, "anthropic-version": API_VERSION}
+    if workspace and WORKSPACE["id"]:
+        h["anthropic-workspace-id"] = WORKSPACE["id"]
+    return h
+
+
+def http_get(path, key, workspace=True, ws_id=None):
+    """GET {BASE}{path} -> (status or None on network error, parsed JSON or None, error message)."""
+    headers = auth_headers(key, workspace)
+    if ws_id:
+        headers["anthropic-workspace-id"] = ws_id
+    req = urllib.request.Request(BASE + path, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status
+            return r.status, json.loads(r.read().decode("utf-8") or "null"), ""
     except urllib.error.HTTPError as e:
-        return e.code
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            msg = json.loads(raw)["error"]["message"]
+        except Exception:  # noqa: BLE001
+            msg = raw[:300] or str(e)
+        return e.code, None, msg
     except Exception as e:  # noqa: BLE001 - any network failure
-        return "network error: %s" % getattr(e, "reason", e)
+        return None, None, "network error: %s" % getattr(e, "reason", e)
 
 
-def save_key(key):
-    d = os.path.dirname(KEY_PATH)
+def needs_workspace(status, msg):
+    # 400: the key needs a workspace. 404: the saved workspace no longer exists.
+    return status in (400, 404) and "workspace" in (msg or "").lower()
+
+
+def save_secret(path, value):
+    d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
     os.chmod(d, 0o700)
-    fd = os.open(KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(key + "\n")
-    os.chmod(KEY_PATH, 0o600)
+        f.write(value + "\n")
+    os.chmod(path, 0o600)
+
+
+def read_secret(path):
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def forget(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def prompt(text):
+    try:
+        return input(text).strip()
+    except (EOFError, KeyboardInterrupt):
+        say()
+        sys.exit(1)
+
+
+def load_workspace():
+    WORKSPACE["id"] = os.environ.get("ANTHROPIC_WORKSPACE_ID", "").strip() or read_secret(WS_PATH)
 
 
 def get_key(ask=False):
@@ -526,13 +578,9 @@ def get_key(ask=False):
         env = os.environ.get("ANTHROPIC_API_KEY", "").strip()
         if env:
             return env
-        try:
-            with open(KEY_PATH) as f:
-                k = f.read().strip()
-            if k:
-                return k
-        except OSError:
-            pass
+        k = read_secret(KEY_PATH)
+        if k:
+            return k
     say("Screen Agent needs an Anthropic API key (console.anthropic.com, API keys).")
     say("It is saved only on this computer, in ~/.screen-agent/key.")
     while True:
@@ -543,15 +591,58 @@ def get_key(ask=False):
             sys.exit(1)
         if not k:
             continue
-        status = check_key(k)
+        status, _, msg = http_get("/v1/models?limit=1", k)
         if status in (401, 403):
             say("That key was rejected. Check it and paste it again.")
             continue
-        if status != 200:
-            say("Couldn't check the key right now (%s); saving it anyway." % status)
-        save_key(k)
+        if status != 200 and not needs_workspace(status, msg):  # workspace-400 = good key
+            say("Couldn't check the key right now (%s); saving it anyway." % (status or msg))
+        save_secret(KEY_PATH, k)
         say("Key saved.")
         return k
+
+
+def workspace_setup(key):
+    """Choose the workspace for an organization-wide key, verify it and save it."""
+    chosen = None
+    status, data, _ = http_get("/v1/organizations/workspaces?include_default=true&limit=100", key, workspace=False)
+    live = []
+    if status == 200 and isinstance(data, dict):
+        live = [w for w in data.get("data") or [] if isinstance(w, dict) and w.get("id") and w.get("archived_at") is None]
+    if len(live) == 1:
+        chosen = live[0]["id"]
+        say("Using workspace %s (%s)." % (live[0].get("name") or chosen, chosen))
+    elif len(live) > 1:
+        say("Your key works in several workspaces. Which one should Screen Agent use?")
+        for i, w in enumerate(live, 1):
+            say("  %d) %s  (%s)" % (i, w.get("name") or w["id"], w["id"]))
+        while chosen is None:
+            n = prompt("Number: ")
+            if n.isdigit() and 1 <= int(n) <= len(live):
+                chosen = live[int(n) - 1]["id"]
+    while True:
+        if chosen is None:
+            say("Your key works across your organization, so Screen Agent needs a workspace ID.")
+            say("Find it at https://platform.claude.com/settings/workspaces (it starts with wrkspc_).")
+            while chosen is None:
+                v = prompt("Paste the workspace ID: ")
+                if WS_RE.match(v):
+                    chosen = v
+        status, _, msg = http_get("/v1/models?limit=1", key, workspace=False, ws_id=chosen)
+        if status is not None and 400 <= status < 500:
+            say("That workspace didn't work: %s" % msg)
+            chosen = None
+            continue
+        WORKSPACE["id"] = chosen
+        save_secret(WS_PATH, chosen)
+        say("Saved workspace %s." % chosen)
+        return
+
+
+def startup_check(key):
+    status, _, msg = http_get("/v1/models?limit=1", key)
+    if needs_workspace(status, msg):
+        workspace_setup(key)
 
 
 # --------------------------------------------------------------------------- agent
@@ -616,9 +707,10 @@ class Agent:
         data = json.dumps(self.body()).encode("utf-8")
         self.last_body_len = len(data)
         attempt = 0
+        ws_retried = False
         while True:
-            headers = {"x-api-key": self.key, "anthropic-version": API_VERSION,
-                       "content-type": "application/json"}
+            headers = auth_headers(self.key)
+            headers["content-type"] = "application/json"
             if not self.compat:
                 headers["anthropic-beta"] = BETAS
             req = urllib.request.Request(BASE + "/v1/messages", data=data, headers=headers, method="POST")
@@ -632,6 +724,13 @@ class Agent:
                     msg = json.loads(raw)["error"]["message"]
                 except Exception:  # noqa: BLE001
                     msg = raw[:300] or str(e)
+                if needs_workspace(code, msg):
+                    if TASK or ws_retried:
+                        say("API error (%d): %s" % (code, msg))
+                        return None
+                    ws_retried = True
+                    workspace_setup(self.key)
+                    continue
                 if code == 400 and not self.compat and re.search(r"fallback|beta|display|thinking", msg, re.I):
                     self.compat = True
                     say(dim("(Retrying in compatibility mode.)"))
@@ -891,11 +990,13 @@ Anything else is a request for Claude, e.g. "open the calculator and add 12 and 
 
 def main():
     screen = Screen()
+    key = get_key()
+    load_workspace()
+    startup_check(key)
     say(bold("Screen Agent — Claude controls this computer. Move the mouse to the top-left corner "
              "or press Ctrl+C to stop."))
     if DRY_RUN:
         say(dim("(Dry run: no mouse or keyboard input will be sent.)"))
-    key = get_key()
     agent = Agent(screen, key)
     say(dim("Model %s · screen %dx%d → screenshots %dx%d" % (MODEL, screen.W, screen.H, screen.sw, screen.sh)))
     try:
@@ -922,11 +1023,11 @@ def main():
                 say("Started a fresh conversation.")
                 continue
             if cmd == "/key":
-                try:
-                    os.remove(KEY_PATH)
-                except OSError:
-                    pass
+                forget(KEY_PATH)
+                forget(WS_PATH)
+                WORKSPACE["id"] = os.environ.get("ANTHROPIC_WORKSPACE_ID", "").strip() or None
                 agent.key = get_key(ask=True)
+                startup_check(agent.key)
                 continue
             agent.run_task(text)
     except KeyboardInterrupt:

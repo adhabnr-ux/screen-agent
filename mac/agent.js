@@ -33,6 +33,8 @@ var EFFORT = env('SCREEN_AGENT_EFFORT') || 'medium';
 var DRY = env('SCREEN_AGENT_DRY_RUN') === '1';
 var ONE_TASK = env('SCREEN_AGENT_TASK');
 var KEY = env('SCREEN_AGENT_KEY') || env('ANTHROPIC_API_KEY');
+var WSFILE = DIR + '/workspace';
+var WS = ''; // set in main(): organization-wide keys need anthropic-workspace-id on every request
 var BETAS = 'server-side-fallback-2026-07-01,thinking-display-updates-2026-08-18';
 var MAX_BODY = 20000000;
 var MAX_CALLS = 200;
@@ -418,8 +420,10 @@ var SYSTEM = [
 function writeCurlConfig() {
   sh('/bin/mkdir -p ' + shq(TMP) + ' && /bin/chmod 700 ' + shq(DIR) + ' && umask 077 && : > ' + shq(CFG));
   var q = function (s) { return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'; };
-  writeFile(CFG, ['header = ' + q('x-api-key: ' + KEY), 'header = ' + q('anthropic-version: 2026-10-21'),
-    'header = ' + q('content-type: application/json'), ''].join('\n'));
+  var lines = ['header = ' + q('x-api-key: ' + KEY), 'header = ' + q('anthropic-version: 2026-10-21'),
+    'header = ' + q('content-type: application/json')];
+  if (WS) lines.push('header = ' + q('anthropic-workspace-id: ' + WS));
+  writeFile(CFG, lines.join('\n') + '\n');
 }
 function http(method, path, body, betas) {
   var req = TMP + '/req.json', resp = TMP + '/resp.json', hdr = TMP + '/resp.h';
@@ -440,6 +444,57 @@ function errMsg(r) {
   if (r.json && r.json.error && r.json.error.message) return r.json.error.message;
   return r.error || (r.text ? r.text.slice(0, 300) : 'HTTP ' + r.code);
 }
+// ---------------------------------------------------------------- workspace (organization-wide keys)
+// 400: key needs a workspace. 404: the saved workspace no longer exists.
+function isWorkspaceError(r) { return (r.code === 400 || r.code === 404) && /workspace/i.test(errMsg(r)); }
+function useWorkspace(id) { WS = id; writeCurlConfig(); }
+// Asks which workspace to use, verifies it and saves it. Returns false if the user gave up (EOF).
+function workspaceSetup() {
+  useWorkspace('');
+  var id = null;
+  var list = http('GET', '/v1/organizations/workspaces?include_default=true&limit=100', null, null);
+  var live = list.code === 200 && list.json && list.json.data ?
+    list.json.data.filter(function (w) { return w && w.id && !w.archived_at; }) : [];
+  if (live.length === 1) {
+    id = live[0].id;
+    say('Using workspace ' + (live[0].name || id) + ' (' + id + ').');
+  } else if (live.length > 1) {
+    say('Your key works in several workspaces. Which one should Screen Agent use?');
+    live.forEach(function (w, i) { say('  ' + (i + 1) + ') ' + (w.name || w.id) + '  (' + w.id + ')'); });
+    while (id === null) {
+      var a = ask('Number: ');
+      if (a === null) return false;
+      var n = parseInt(a.trim(), 10);
+      if (n >= 1 && n <= live.length) id = live[n - 1].id;
+    }
+  }
+  var explained = false;
+  while (true) {
+    while (!id) {
+      if (!explained) {
+        say('Your key works across your organization, so Screen Agent needs a workspace ID.');
+        say('Find it at https://platform.claude.com/settings/workspaces (it starts with wrkspc_).');
+        explained = true;
+      }
+      var p = ask('Paste the workspace ID: ');
+      if (p === null) return false;
+      p = p.trim();
+      if (/^wrkspc_[A-Za-z0-9]+$/.test(p)) id = p;
+      else say("That isn't a workspace ID. It starts with wrkspc_.");
+    }
+    useWorkspace(id);
+    var r = http('GET', '/v1/models?limit=1', null, null);
+    if (r.code === 200 || r.code === 0 || r.code >= 500) {
+      sh('umask 077 && printf %s ' + shq(id) + ' > ' + shq(WSFILE));
+      say('Saved workspace ' + id + '.');
+      return true;
+    }
+    fail("That workspace didn't work: " + errMsg(r));
+    useWorkspace('');
+    id = null;
+  }
+}
+
 function buildBody(messages) {
   var body = {
     model: MODEL, max_tokens: 16000, system: SYSTEM,
@@ -454,10 +509,15 @@ function buildBody(messages) {
 }
 // Returns the parsed response, or null after printing why it failed.
 function callApi(messages) {
-  var waits = [2, 4, 8, 16, 30];
+  var waits = [2, 4, 8, 16, 30], wsRetried = false;
   for (var attempt = 0; ; attempt++) {
     var r = http('POST', '/v1/messages', buildBody(messages), compat ? null : BETAS);
     if (r.code === 200 && r.json) return r.json;
+    if (isWorkspaceError(r) && !wsRetried && !ONE_TASK) {
+      warn(errMsg(r));
+      if (!workspaceSetup()) return null;
+      wsRetried = true; attempt--; continue;
+    }
     var retryable = r.code === 0 || [429, 500, 502, 503, 504, 529].indexOf(r.code) >= 0;
     if (r.code === 400 && !compat && /fallback|beta|display|thinking/i.test(errMsg(r))) {
       compat = true; attempt--; continue;
@@ -585,9 +645,13 @@ function help() {
 function main() {
   if (!KEY) { fail('No API key. Start Screen Agent with the launcher command so it can ask for one.'); return 1; }
   if (!checkPermissions()) return EXIT_PERMISSIONS;
+  WS = (env('ANTHROPIC_WORKSPACE_ID') || readFile(WSFILE)).trim();
   writeCurlConfig();
+  var probe = http('GET', '/v1/models?limit=1', null, null);
+  if (isWorkspaceError(probe) && !workspaceSetup()) { fail('No workspace chosen, so Screen Agent can\'t start.'); return 1; }
+  if (probe.code === 401) { fail('API key rejected — type /key to enter a new one.'); }
   say(C.bold + 'Screen Agent' + C.off + ' — Claude controls this computer. Move the mouse to the top-left corner or press Ctrl+C to stop.');
-  say(C.dim + 'Model ' + MODEL + ' · screen ' + W + 'x' + H + ' (sent as ' + SW + 'x' + SH + ')' + (DRY ? ' · DRY RUN: no clicks or typing' : '') + C.off);
+  say(C.dim + 'Model ' + MODEL + ' · screen ' + W + 'x' + H + ' (sent as ' + SW + 'x' + SH + ')' + (WS ? ' · workspace ' + WS : '') + (DRY ? ' · DRY RUN: no clicks or typing' : '') + C.off);
   if (ONE_TASK) { runTask(ONE_TASK); return 0; }
   help();
   while (true) {

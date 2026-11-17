@@ -54,6 +54,8 @@ $DOT = [string][char]0x00B7
 if ($env:APPDATA) { $S.KeyDir = Join-Path $env:APPDATA 'screen-agent' }
 else { $S.KeyDir = Join-Path $HOME '.screen-agent' }
 $S.KeyFile = Join-Path $S.KeyDir 'key.dat'
+$S.WsFile = Join-Path $S.KeyDir 'workspace.txt'
+$S.Workspace = $null
 
 # ---------------------------------------------------------------------------------------------
 # 2. Native helpers (C#). JSON span extraction runs everywhere; Win32 calls only on Windows.
@@ -351,6 +353,7 @@ function Read-Utf8($resp) {
 }
 function Get-Headers {
     $h = @{ 'x-api-key' = $S.Key; 'anthropic-version' = $S.ApiVersion }
+    if ($S.Workspace) { $h['anthropic-workspace-id'] = $S.Workspace }
     return $h
 }
 
@@ -359,6 +362,7 @@ function Invoke-Claude {
     $waits = @(2, 4, 8, 16, 30)
     $attempt = 0
     $compatTried = $false
+    $wsTried = $false
     while ($true) {
         $body = Build-Body
         $S.LastBodyLen = $body.Length
@@ -376,6 +380,16 @@ function Invoke-Claude {
                 Write-Host 'The API rejected an optional feature; retrying in compatibility mode.' -ForegroundColor Yellow
                 $S.Compat = $true; $compatTried = $true
                 continue
+            }
+            if ($e.Status -eq 400 -and ($msg -match 'workspace')) {
+                if ($S.Task -or $wsTried) {
+                    Write-Host ('API error (HTTP 400): ' + $msg) -ForegroundColor Red
+                    return $null
+                }
+                Write-Host 'This API key needs a workspace.' -ForegroundColor Yellow
+                $wsTried = $true
+                if (Setup-Workspace) { continue }
+                return $null
             }
             if ($e.Status -eq 401) {
                 Write-Host 'API key rejected - type /key to enter a new one.' -ForegroundColor Red
@@ -402,12 +416,16 @@ function Invoke-Claude {
 # 6. API key
 # ---------------------------------------------------------------------------------------------
 function Test-ApiKey([string]$key) {
+    $h = @{ 'x-api-key' = $key; 'anthropic-version' = $S.ApiVersion }
+    if ($S.Workspace) { $h['anthropic-workspace-id'] = $S.Workspace }
     try {
-        $null = Invoke-WebRequest -Uri ($S.Base + '/v1/models?limit=1') -Method Get -Headers @{ 'x-api-key' = $key; 'anthropic-version' = $S.ApiVersion } -UseBasicParsing -TimeoutSec 30
+        $null = Invoke-WebRequest -Uri ($S.Base + '/v1/models?limit=1') -Method Get -Headers $h -UseBasicParsing -TimeoutSec 30
         return 'ok'
     } catch {
         $e = Get-HttpError $_
         if ($e.Status -eq 401 -or $e.Status -eq 403) { return 'rejected' }
+        # An organization-wide key answers 400 "needs a workspace": the key itself is good.
+        if ($e.Status -eq 400 -and ((Get-ApiErrorMessage $e.Body $e.Message) -match 'workspace')) { return 'ok' }
         return 'unknown'
     }
 }
@@ -455,9 +473,110 @@ function Ensure-Key {
 }
 function Reset-Key {
     try { if (Test-Path -LiteralPath $S.KeyFile) { Remove-Item -LiteralPath $S.KeyFile -Force } } catch { }
+    try { if (Test-Path -LiteralPath $S.WsFile) { Remove-Item -LiteralPath $S.WsFile -Force } } catch { }
+    $S.Workspace = $null
     if ($S.KeyFromEnv) { Write-Host 'Note: ANTHROPIC_API_KEY is set in this window; the new key replaces it for this session.' -ForegroundColor Yellow }
     $S.Key = Prompt-Key
     $S.KeyFromEnv = $false
+    Check-Workspace
+}
+
+# ---------------------------------------------------------------------------------------------
+# 6b. Workspace (organization-wide keys need an anthropic-workspace-id header)
+# ---------------------------------------------------------------------------------------------
+function Read-Answer([string]$prompt) {
+    Write-Host $prompt -NoNewline -ForegroundColor Cyan
+    $a = [Console]::ReadLine()
+    if ($null -eq $a) { return $null }
+    return $a.Trim()
+}
+function Load-Workspace {
+    if ($env:ANTHROPIC_WORKSPACE_ID) { $S.Workspace = $env:ANTHROPIC_WORKSPACE_ID.Trim(); return }
+    try {
+        if (Test-Path -LiteralPath $S.WsFile) {
+            $v = (Get-Content -LiteralPath $S.WsFile -Raw).Trim()
+            if ($v) { $S.Workspace = $v }
+        }
+    } catch { }
+}
+function Save-Workspace([string]$id) {
+    try {
+        if (-not (Test-Path -LiteralPath $S.KeyDir)) { $null = New-Item -ItemType Directory -Path $S.KeyDir -Force }
+        Set-Content -LiteralPath $S.WsFile -Value $id -Encoding ASCII
+    } catch {
+        Write-Host ('Could not save the workspace (' + $_.Exception.Message + '); you will be asked again next time.') -ForegroundColor Yellow
+    }
+}
+# GET /v1/models?limit=1 with the current headers. Returns @{ Status; Message } (Status 0 = network).
+function Get-ModelsCheck {
+    try {
+        $null = Invoke-WebRequest -Uri ($S.Base + '/v1/models?limit=1') -Method Get -Headers (Get-Headers) -UseBasicParsing -TimeoutSec 30
+        return @{ Status = 200; Message = '' }
+    } catch {
+        $e = Get-HttpError $_
+        return @{ Status = $e.Status; Message = (Get-ApiErrorMessage $e.Body $e.Message) }
+    }
+}
+# Workspaces this key can use (archived ones skipped), or an empty list if they can't be listed.
+function Get-LiveWorkspaces {
+    $list = New-Object System.Collections.ArrayList
+    $h = @{ 'x-api-key' = $S.Key; 'anthropic-version' = $S.ApiVersion }
+    try {
+        $r = Invoke-WebRequest -Uri ($S.Base + '/v1/organizations/workspaces?include_default=true&limit=100') -Method Get -Headers $h -UseBasicParsing -TimeoutSec 30
+        $o = (Read-Utf8 $r) | ConvertFrom-Json
+        foreach ($w in @($o.data)) {
+            if ($null -ne $w -and $w.id -and $null -eq $w.archived_at) { $null = $list.Add($w) }
+        }
+    } catch { }
+    return , $list
+}
+function Ask-WorkspaceId {
+    Write-Host 'Your key works across your organization, so Screen Agent needs a workspace ID.'
+    Write-Host 'Find it at https://platform.claude.com/settings/workspaces (it starts with wrkspc_).'
+    while ($true) {
+        $a = Read-Answer 'Paste the workspace ID: '
+        if ($null -eq $a) { return $null }
+        if ($a -match '^wrkspc_[A-Za-z0-9]+$') { return $a }
+    }
+}
+# Finds, verifies and saves a workspace ID. Returns $true when one is set.
+function Setup-Workspace {
+    $id = $null
+    $live = Get-LiveWorkspaces
+    if ($live.Count -eq 1) {
+        $id = [string]$live[0].id
+        Write-Host ('Using workspace ' + $live[0].name + ' (' + $id + ').')
+    } elseif ($live.Count -gt 1) {
+        Write-Host 'Your key works in several workspaces. Which one should Screen Agent use?'
+        for ($i = 0; $i -lt $live.Count; $i++) { Write-Host ('  ' + ($i + 1) + ') ' + $live[$i].name + '  (' + $live[$i].id + ')') }
+        while ($null -eq $id) {
+            $a = Read-Answer 'Number: '
+            if ($null -eq $a) { return $false }
+            $n = 0
+            if ([int]::TryParse($a, [ref]$n) -and $n -ge 1 -and $n -le $live.Count) { $id = [string]$live[$n - 1].id }
+        }
+    } else {
+        $id = Ask-WorkspaceId
+        if ($null -eq $id) { return $false }
+    }
+    while ($true) {
+        $S.Workspace = $id
+        $c = Get-ModelsCheck
+        if ($c.Status -eq 200) { Save-Workspace $id; Write-Host ('Saved workspace ' + $id + '.') -ForegroundColor Green; return $true }
+        if ($c.Status -eq 0) { Save-Workspace $id; Write-Host ('Could not check the workspace right now (network); saved ' + $id + ' anyway.') -ForegroundColor Yellow; return $true }
+        Write-Host ("That workspace didn't work: " + $c.Message) -ForegroundColor Red
+        $S.Workspace = $null
+        $id = Ask-WorkspaceId
+        if ($null -eq $id) { return $false }
+    }
+}
+# Startup check: if the key needs a workspace (or the saved one is gone), set one up.
+function Check-Workspace {
+    $c = Get-ModelsCheck
+    if (($c.Status -eq 400 -or $c.Status -eq 404) -and ($c.Message -match 'workspace')) {
+        if ($S.Workspace) { Write-Host ('The saved workspace ' + $S.Workspace + " didn't work: " + $c.Message) -ForegroundColor Yellow; $S.Workspace = $null }
+        $null = Setup-Workspace
+    }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -810,6 +929,8 @@ Rules:
     Write-Host ('Model ' + $S.Model + ' | screen ' + $S.W + 'x' + $S.H + ' (sent as ' + $S.SW + 'x' + $S.SH + ')' + $mode) -ForegroundColor DarkGray
 
     Ensure-Key
+    Load-Workspace
+    Check-Workspace
 
     if ($S.Task) {
         $S.TaskText = $S.Task

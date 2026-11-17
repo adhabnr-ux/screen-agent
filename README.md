@@ -26,6 +26,12 @@ API Keys. The key is saved only on that computer: in `~/.screen-agent/key` (read
 on macOS and Linux, and encrypted with your Windows login in `%APPDATA%\screen-agent\key.dat`
 on Windows. Usage is billed to whoever's key it is.
 
+If your key belongs to an organization and isn't tied to one workspace, the agent lists the
+workspaces it can use and asks which one to bill. If it can't list them, it asks you to paste the
+workspace ID (starts with `wrkspc_`) from
+[platform.claude.com/settings/workspaces](https://platform.claude.com/settings/workspaces). The
+choice is saved next to the key. `/key` forgets both. You can also set `ANTHROPIC_WORKSPACE_ID`.
+
 Then type what you want, for example:
 
 > Open a browser, go to wikipedia.org and find the population of Tucson.

@@ -12,6 +12,7 @@ implement this same behavior. Nothing may be installed: only what ships with the
 | `SCREEN_AGENT_MODEL` | `claude-opus-5-5` | |
 | `SCREEN_AGENT_EFFORT` | `medium` | `low` `medium` `high` `xhigh` `max` |
 | `SCREEN_AGENT_DRY_RUN` | unset | `1` = log input actions, send no mouse/keyboard events (screenshots still real). |
+| `ANTHROPIC_WORKSPACE_ID` | unset | Workspace for organization-wide keys (see Workspace). |
 | `SCREEN_AGENT_TASK` | unset | Run this one task non-interactively, then exit (used by tests). |
 
 ## API key
@@ -24,6 +25,36 @@ implement this same behavior. Nothing may be installed: only what ships with the
 - Never put the key on a command line (visible in `ps`). Header files / env only.
 - `/key` command deletes the saved key and asks again.
 
+## Workspace (organization-wide keys)
+
+Some keys aren't tied to one workspace; every request with such a key must carry
+`anthropic-workspace-id: wrkspc_...`, or the API answers 400 with a message containing
+`anthropic-workspace-id` / "not scoped to a workspace".
+
+- `ANTHROPIC_WORKSPACE_ID` env var overrides; otherwise the saved ID: `~/.screen-agent/workspace`
+  (0600) on macOS/Linux, `%APPDATA%\screen-agent\workspace.txt` on Windows.
+- When a workspace ID is known, send `anthropic-workspace-id: <id>` on EVERY request (models, messages).
+- **Startup check** (after the key is known, before the banner): `GET /v1/models?limit=1`.
+  If it returns 400 or 404 and the error message mentions `workspace` (404 = the saved workspace
+  was deleted), run **workspace setup**:
+  1. `GET /v1/organizations/workspaces?include_default=true&limit=100` (same headers, no workspace
+     header). If 200 and `data` has entries with `archived_at` null:
+     - exactly one → use it, print `Using workspace <name> (<id>).`
+     - several → print `Your key works in several workspaces. Which one should Screen Agent use?`,
+       then `  1) <name>  (<id>)` per workspace, then prompt `Number: ` until valid.
+  2. Otherwise (403/404/error/empty): print
+     `Your key works across your organization, so Screen Agent needs a workspace ID.`
+     `Find it at https://platform.claude.com/settings/workspaces (it starts with wrkspc_).`
+     and prompt `Paste the workspace ID: ` until a value matching `^wrkspc_[A-Za-z0-9]+$`.
+  3. Verify with `GET /v1/models?limit=1` plus the header: 200 → save, print
+     `Saved workspace <id>.`; 4xx → print `That workspace didn't work: <error.message>` and go
+     back to step 2 (manual entry). Network error → save anyway.
+- If a `/v1/messages` call returns 400 mentioning `workspace` mid-session: in interactive mode run
+  workspace setup, then retry that request once; with `SCREEN_AGENT_TASK`, print the error and end.
+- `/key` forgets both the key and the saved workspace.
+- Key validation at first run: a 400 whose message mentions `workspace` means the key is GOOD
+  (save it, then workspace setup runs). Don't print "Couldn't reach the API" for it.
+
 ## Request
 
 `POST {base}/v1/messages`, headers:
@@ -32,6 +63,7 @@ x-api-key: <key>
 anthropic-version: 2026-10-21
 content-type: application/json
 anthropic-beta: server-side-fallback-2026-07-01,thinking-display-updates-2026-08-18
+anthropic-workspace-id: <id>      (only when a workspace ID is known)
 ```
 Body (key order irrelevant):
 ```json

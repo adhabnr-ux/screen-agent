@@ -50,7 +50,7 @@ nonascii=$(python3 -c "import sys;[print(f,i+1) for f in sys.argv[1:] for i,l in
 [ -z "$nonascii" ] && pass "scripts are ASCII" || { bad "non-ASCII characters"; echo "$nonascii"; }
 
 # --- 4. protocol runs against the mock --------------------------------------------------------
-run_case() {  # name, mock-env, launch-mode (file|scriptblock)
+run_case() {  # name, mock-env, launch-mode (file|scriptblock); stdin text in $STDIN_TEXT, extra env in $AGENT_ENV
   local name="$1" menv="$2" mode="$3" port=$((20000 + RANDOM % 20000))
   local rep="$T/$name.json" log="$T/$name.log" stub="$T/$name.stub"
   env $menv MOCK_REPORT="$rep" python3 test/mock_api.py --port $port >/dev/null 2>&1 &
@@ -58,10 +58,12 @@ run_case() {  # name, mock-env, launch-mode (file|scriptblock)
   for _ in $(seq 50); do curl -s "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1 && break; sleep 0.1; done
   local launch="& '$PWD/windows/agent.ps1'"
   [ "$mode" = scriptblock ] && launch="& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '$PWD/windows/agent.ps1')))"
-  SCREEN_AGENT_BASE_URL="http://127.0.0.1:$port" ANTHROPIC_API_KEY=sk-test-good \
+  mkdir -p "$T/appdata-$name"
+  printf "%b" "${STDIN_TEXT:-}" > "$T/$name.stdin"
+  tmo 120 env ${AGENT_ENV:-} APPDATA="$T/appdata-$name" SCREEN_AGENT_BASE_URL="http://127.0.0.1:$port" ANTHROPIC_API_KEY=sk-test-good \
   SCREEN_AGENT_TASK="Run the test batch" SCREEN_AGENT_TEST_STUB="$PWD/test/windows_stub.ps1" \
   SCREEN_AGENT_STUB_JPEG="$T/screen.jpg" SCREEN_AGENT_STUB_LOG="$stub" SCREEN_AGENT_STUB_CURSOR="${STUB_CURSOR:-500,500}" \
-    tmo 120 "$PWSH" -NoProfile -NonInteractive -Command "$launch" >"$log" 2>&1
+    "$PWSH" -NoProfile -NonInteractive -Command "$launch" <"$T/$name.stdin" >"$log" 2>&1
   local rc=$?
   kill $mpid 2>/dev/null; wait $mpid 2>/dev/null
   echo "---- $name (exit $rc) agent output:"; sed 's/^/  | /' "$log"
@@ -94,7 +96,23 @@ STUB_CURSOR="0,0" run_case failsafe "" file
 if grep -q "Stopped (mouse in top-left corner)" "$T/failsafe.log" && ! grep -qE "^(move|mouse|key|type)" "$T/failsafe.stub"; then
   pass "failsafe: cursor in corner stops before any input"; else bad "failsafe"; fi
 
-# --- 5. launcher -------------------------------------------------------------------------------
+# --- 5. organization-wide keys (anthropic-workspace-id) -----------------------------------------
+STDIN_TEXT="2\n" run_case ws_pick "MOCK_UNSCOPED=1" file
+check_report ws_pick "r['workspace']=='wrkspc_01TESTSECOND'" && grep -q "1) Default Workspace  (wrkspc_01TESTDEFAULT)" "$T/ws_pick.log" \
+  && ! grep -q "Old" "$T/ws_pick.log" && grep -q "Saved workspace wrkspc_01TESTSECOND." "$T/ws_pick.log" \
+  && grep -qx "wrkspc_01TESTSECOND" "$T/appdata-ws_pick/screen-agent/workspace.txt" \
+  && pass "workspace list: picked #2, archived hidden, saved to workspace.txt, session done" || bad "workspace pick"
+
+STDIN_TEXT="wrkspc_01NOPE\nwrkspc_01TESTDEFAULT\n" run_case ws_paste "MOCK_UNSCOPED=nolist" file
+check_report ws_paste "r['workspace']=='wrkspc_01TESTDEFAULT'" && grep -q "That workspace didn't work: Workspace wrkspc_01NOPE not found." "$T/ws_paste.log" \
+  && grep -q "Saved workspace wrkspc_01TESTDEFAULT." "$T/ws_paste.log" \
+  && pass "workspace paste: bad ID rejected, good ID verified, session done" || bad "workspace paste"
+
+AGENT_ENV="ANTHROPIC_WORKSPACE_ID=wrkspc_01TESTSECOND" run_case ws_env "MOCK_UNSCOPED=1" file
+check_report ws_env "r['workspace']=='wrkspc_01TESTSECOND'" && ! grep -qE "Number:|Paste the workspace|several workspaces" "$T/ws_env.log" \
+  && pass "ANTHROPIC_WORKSPACE_ID: header sent, no prompt" || bad "workspace env override"
+
+# --- 6. launcher -------------------------------------------------------------------------------
 cmd=$(SCREEN_AGENT_LAUNCH_PRINT=1 SCREEN_AGENT_REPO_RAW="http://127.0.0.1:1/x" "$PWSH" -NoProfile -File windows/run.ps1)
 echo "$cmd" | grep -q '"' && bad "launcher command contains a double quote" || pass "launcher command has no double quotes"
 out=$("$PWSH" -NoProfile -Command "\$e=\$null;\$t=\$null;[void][System.Management.Automation.Language.Parser]::ParseInput(@'
