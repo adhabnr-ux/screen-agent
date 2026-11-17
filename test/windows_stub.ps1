@@ -19,9 +19,13 @@ function Plat-GetCursor {
     return @([int]$p[0], [int]$p[1])
 }
 function Plat-SetCursor([int]$x, [int]$y) { Stub-Log "move $x,$y" }
+function Plat-DragMove([int]$x, [int]$y) { Stub-Log "dragmove $x,$y" }
 function Plat-Mouse([uint32]$flags, [int]$data) { Stub-Log ('mouse 0x{0:x} {1}' -f $flags, $data) }
 function Plat-Key([int]$vk, [bool]$up) { Stub-Log ('key 0x{0:x2} {1}' -f $vk, $(if ($up) { 'up' } else { 'down' })) }
-function Plat-TypeText([string]$text) { Stub-Log ('type ' + $text.Replace("`n", '\n')) }
+function Plat-TypeChar([string]$ch) {
+    $hex = @(); foreach ($c in $ch.ToCharArray()) { $hex += ('{0:x4}' -f [int]$c) }
+    Stub-Log ('char ' + ($hex -join ' '))
+}
 function Plat-VkForChar([char]$c) {
     $us = @{ '-' = 0xBD; '=' = 0xBB; ',' = 0xBC; '.' = 0xBE; '/' = 0xBF; ';' = 0xBA; "'" = 0xDE; '[' = 0xDB; ']' = 0xDD; '\' = 0xDC; '`' = 0xC0; ' ' = 0x20
              '+' = 0x1BB; '?' = 0x1BF; '!' = 0x131; '@' = 0x132; '#' = 0x133; '$' = 0x134; '%' = 0x135 }

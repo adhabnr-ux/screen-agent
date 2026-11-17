@@ -26,7 +26,8 @@ fi
 [ -s "$T/screen.jpg" ] && pass "stub JPEG generated" || bad "stub JPEG"
 
 # --- 2. parse check ---------------------------------------------------------------------------
-for f in windows/agent.ps1 windows/run.ps1 test/windows_stub.ps1; do
+PSFILES="windows/agent.ps1 windows/run.ps1 test/windows_stub.ps1 test/windows_real_input.ps1 test/windows_real_input_helper.ps1 test/windows_json_test.ps1 test/windows_motion_test.ps1"
+for f in $PSFILES; do
   out=$("$PWSH" -NoProfile -Command "\$e=\$null; \$t=\$null; [void][System.Management.Automation.Language.Parser]::ParseFile('$PWD/$f',[ref]\$t,[ref]\$e); if(\$e){\$e|%{ \$_.Extent.StartLineNumber.ToString() + ': ' + \$_.Message }; exit 1}")
   [ $? -eq 0 ] && pass "parse $f" || { bad "parse $f"; echo "$out"; }
 done
@@ -43,6 +44,7 @@ for f in sys.argv[1:]:
 PY
 }
 code=$(psonly windows/agent.ps1 windows/run.ps1)
+testcode=$(psonly test/windows_real_input.ps1 test/windows_real_input_helper.ps1)
 lint=$(echo "$code" | grep -E '\?\?|\?\.|&&|\|\||-AsHashtable|ForEach-Object -Parallel|Get-Error|-SkipCertificateCheck|ConvertFrom-Json -Depth')
 tern=$(echo "$code" | grep -E '\) \? [^:]+ : ')
 [ -z "$lint$tern" ] && pass "no PowerShell 7-only syntax" || { bad "PS7-only syntax"; echo "$lint$tern"; }
@@ -50,7 +52,12 @@ tern=$(echo "$code" | grep -E '\) \? [^:]+ : ')
   && pass "exactly one C# compile site; no other route to native input" || bad "extra compile/native route"
 out=$("$PWSH" -NoProfile -File test/windows_json_test.ps1 "$PWD/windows/agent.ps1" 2>&1)
 [ $? -eq 0 ] && pass "pure-PowerShell JSON extractor ($(echo "$out" | grep -c '^ok') checks)" || { bad "JSON extractor"; echo "$out"; }
-nonascii=$(python3 -c "import sys;[print(f,i+1) for f in sys.argv[1:] for i,l in enumerate(open(f,encoding='utf-8')) if any(ord(c)>127 for c in l)]" windows/agent.ps1 windows/run.ps1)
+out=$("$PWSH" -NoProfile -File test/windows_motion_test.ps1 "$PWD/windows/agent.ps1" 2>&1)
+if [ $? -eq 0 ]; then pass "pointer path + typing pace unit tests ($(echo "$out" | grep -c '^ok') checks)"; echo "$out" | grep -E "600 px move|15 characters at 110|stop corner" | sed 's/^/        /'
+else bad "pointer path / typing pace unit tests"; echo "$out" | grep -v '^ok'; fi
+tlint=$(echo "$testcode" | grep -E '\?\?|\?\.|&&|\|\||-AsHashtable|ForEach-Object -Parallel|\) \? [^:]+ : ')
+[ -z "$tlint" ] && pass "real-input test scripts: no PowerShell 7-only syntax" || { bad "PS7-only syntax in real-input test"; echo "$tlint"; }
+nonascii=$(python3 -c "import sys;[print(f,i+1) for f in sys.argv[1:] for i,l in enumerate(open(f,encoding='utf-8')) if any(ord(c)>127 for c in l)]" $PSFILES)
 [ -z "$nonascii" ] && pass "scripts are ASCII" || { bad "non-ASCII characters"; echo "$nonascii"; }
 
 # --- 4. protocol runs against the mock --------------------------------------------------------
@@ -62,12 +69,14 @@ run_case() {  # name, mock-env, launch-mode (file|scriptblock); stdin text in $S
   for _ in $(seq 50); do curl -s "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1 && break; sleep 0.1; done
   local launch="& '$PWD/windows/agent.ps1'"
   [ "$mode" = scriptblock ] && launch="& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '$PWD/windows/agent.ps1')))"
+  local wpmenv="SCREEN_AGENT_WPM=0"   # typing pace off for speed, except where a test asks for the default
+  [ "${TEST_WPM:-}" = default ] && wpmenv="SCREEN_AGENT_UNUSED=1"
   mkdir -p "$T/appdata-$name"
   printf "%b" "${STDIN_TEXT:-}" > "$T/$name.stdin"
   tmo 120 env ${AGENT_ENV:-} APPDATA="$T/appdata-$name" SCREEN_AGENT_BASE_URL="http://127.0.0.1:$port" ANTHROPIC_API_KEY=sk-test-good \
   SCREEN_AGENT_TASK="Run the test batch" SCREEN_AGENT_TEST_STUB="$PWD/test/windows_stub.ps1" \
-  SCREEN_AGENT_STUB_JPEG="$T/screen.jpg" SCREEN_AGENT_STUB_LOG="$stub" SCREEN_AGENT_STUB_CURSOR="${STUB_CURSOR:-500,500}" \
-    "$PWSH" -NoProfile -NonInteractive -Command "$launch; if ('ScreenAgentWin1' -as [type]) { 'INPUT-LAYER-COMPILED' } else { 'INPUT-LAYER-NOT-COMPILED' }" <"$T/$name.stdin" >"$log" 2>&1
+  SCREEN_AGENT_STUB_JPEG="$T/screen.jpg" SCREEN_AGENT_STUB_LOG="$stub" SCREEN_AGENT_STUB_CURSOR="${STUB_CURSOR:-500,500}" $wpmenv \
+    "$PWSH" -NoProfile -NonInteractive -Command "$launch; if ('ScreenAgentWin2' -as [type]) { 'INPUT-LAYER-COMPILED' } else { 'INPUT-LAYER-NOT-COMPILED' }" <"$T/$name.stdin" >"$log" 2>&1
   local rc=$?
   kill $mpid 2>/dev/null; wait $mpid 2>/dev/null
   echo "---- $name (exit $rc) agent output:"; sed 's/^/  | /' "$log"
@@ -83,11 +92,32 @@ sys.exit(0 if ok else 1)
 EOF
 }
 
-run_case normal "" scriptblock
+TEST_WPM=default run_case normal "" scriptblock
 check_report normal "r['calls']==5 and not r['guide'] and r['speed'] is None" && grep -q "Model claude-sonnet-5-5 " "$T/normal.log" && grep -qx "INPUT-LAYER-COMPILED" "$T/normal.log" && pass "full 5-call session via scriptblock launch (as run.ps1 does), default model claude-sonnet-5-5" || bad "normal session"
 check_report normal "['auto',1280,720] in r['image_sizes']" && [ "$(grep -c 'capture 0,0 1920x1080 -> 1280x720' "$T/normal.stub")" = 3 ] \
   && pass "auto-screenshot attached to the clean batch only (3 full captures: 2 asked + 1 automatic)" || bad "auto-screenshot: $(grep -c 'capture 0,0 1920x1080' "$T/normal.stub") full captures"
-grep -q "type héllo wörld\\\\nline2" "$T/normal.stub" && pass "unicode text reached the type layer intact" || bad "typed text mangled: $(grep '^type' "$T/normal.stub")"
+typed() { python3 -c "
+import sys
+out=''
+for l in open(sys.argv[1], encoding='utf-8'):
+    if l.startswith('char '): out += ''.join(chr(int(h,16)) for h in l.split()[1:])
+print(ascii(out))" "$1"; }
+[ "$(typed "$T/normal.stub")" = "'h\xe9llo w\xf6rld\nline2abc'" ] && pass "unicode text reached the type layer intact, one character at a time ($(grep -c '^char' "$T/normal.stub") characters)" || bad "typed text mangled: $(typed "$T/normal.stub")"
+# glide: the stub pointer sits at 500,500; mouse_move to 300,225 is 340 px -> T=0.256 s -> 21 steps ending exactly on target
+python3 - "$T/normal.stub" <<'PY' && pass "glide: 21 eased steps to the first target; drag sent as 26 held moves between press and release" || bad "glide/drag sequence in stub log"
+import sys
+L = [l.strip() for l in open(sys.argv[1], encoding="utf-8")]
+i = L.index("move 300,225")
+first = [l for l in L[:i + 1] if l.startswith("move ")]
+ok = len(first) == 21 and len(set(first)) >= 15
+d0 = L.index("move 150,150")                      # drag start (100,100 in screenshot space)
+up = L.index("mouse 0x4 0", d0 + 1)
+held = L[d0 + 2:up]
+# 150,150 -> 300,300 is 212 px: T=0.2049 -> drag T=0.3073 -> 26 steps
+ok = ok and L[d0 + 1] == "mouse 0x2 0" and all(h.startswith("dragmove ") for h in held) and len(held) == 26 and held[-1] == "dragmove 300,300"
+print("        first glide steps:", len(first), "| held drag moves:", len(held), "| last:", held[-1] if held else None)
+sys.exit(0 if ok else 1)
+PY
 grep -q "capture 0,0 1920x1080 -> 1280x720" "$T/normal.stub" && pass "screenshot scaled 1920x1080 -> 1280x720" || bad "screenshot scaling"
 grep -q "capture 0,0 600x375 -> 1152x720" "$T/normal.stub" && pass "zoom region mapped to 600x375 screen px, fit to 1152x720" || bad "zoom mapping: $(grep 'capture' "$T/normal.stub")"
 grep -q "move 315,240" "$T/normal.stub" && pass "click coordinate 210,160 -> 315,240 screen px" || bad "coordinate mapping"
@@ -99,7 +129,7 @@ run_case compat "MOCK_REJECT_BETA=1" file
 check_report compat "r['compat']" && grep -q "compatibility mode" "$T/compat.log" && pass "compat mode after beta rejection" || bad "compat mode"
 
 STUB_CURSOR="0,0" run_case failsafe "" file
-if grep -q "Stopped (mouse in top-left corner)" "$T/failsafe.log" && ! grep -qE "^(move|mouse|key|type)" "$T/failsafe.stub"; then
+if grep -q "Stopped (mouse in top-left corner)" "$T/failsafe.log" && ! grep -qE "^(move|dragmove|mouse|key|char)" "$T/failsafe.stub"; then
   pass "failsafe: cursor in corner stops before any input"; else bad "failsafe"; fi
 
 # --- 5. organization-wide keys (anthropic-workspace-id) -----------------------------------------
@@ -152,7 +182,7 @@ check_report fast_rej "r['speed_rejected'] and r['speed'] is None" && grep -q "F
 
 AGENT_ENV="SCREEN_AGENT_MODE=guide" run_case guide "" file
 check_report guide "r['guide'] and r['calls']==2" && grep -q "Screen Agent (guide mode)" "$T/guide.log" \
-  && ! grep -qE "^(move|mouse|key|type)" "$T/guide.stub" && [ "$(grep -c '^capture' "$T/guide.stub")" = 1 ] \
+  && ! grep -qE "^(move|dragmove|mouse|key|char)" "$T/guide.stub" && [ "$(grep -c '^capture' "$T/guide.stub")" = 1 ] \
   && grep -qx "INPUT-LAYER-NOT-COMPILED" "$T/guide.log" \
   && pass "guide mode: 13 input members disabled, guide prompt + banner, zero input events, no auto-screenshot, no C# compiled" || bad "guide mode"
 
@@ -160,11 +190,15 @@ AGENT_ENV="SCREEN_AGENT_TEST_NO_COMPILE=1" run_case nocompile "" file
 check_report nocompile "r['guide'] and r['calls']==2" \
   && grep -qF "This computer's policy doesn't let Screen Agent control the mouse and keyboard. Continuing in guide mode: Claude sees the screen and tells you what to click." "$T/nocompile.log" \
   && grep -q "Screen Agent (guide mode)" "$T/nocompile.log" && grep -qx "INPUT-LAYER-NOT-COMPILED" "$T/nocompile.log" \
-  && ! grep -qE "^(move|mouse|key|type)" "$T/nocompile.stub" \
+  && ! grep -qE "^(move|dragmove|mouse|key|char)" "$T/nocompile.stub" \
   && pass "compile blocked: policy message, falls back to guide mode, zero input events" || bad "compile-blocked fallback"
 
+AGENT_ENV="SCREEN_AGENT_SMOOTH=0" run_case nosmooth "" file
+check_report nosmooth "" && [ "$(grep -c '^move' "$T/nosmooth.stub")" = 8 ] && [ "$(grep -c '^dragmove' "$T/nosmooth.stub")" = 12 ] \
+  && pass "SCREEN_AGENT_SMOOTH=0: 8 direct moves, drag still sends 12 intermediate moves" || bad "SMOOTH=0: $(grep -c '^move' "$T/nosmooth.stub") moves, $(grep -c '^dragmove' "$T/nosmooth.stub") drag moves"
+
 AGENT_ENV="SCREEN_AGENT_DRY_RUN=1" run_case dry "" file
-check_report dry "['auto',1280,720] in r['image_sizes']" && ! grep -qE "^(move|mouse|key|type)" "$T/dry.stub" \
+check_report dry "['auto',1280,720] in r['image_sizes']" && ! grep -qE "^(move|dragmove|mouse|key|char)" "$T/dry.stub" \
   && pass "dry run: zero input events, auto-screenshot still attached" || bad "dry run"
 
 # --- 7. launcher -------------------------------------------------------------------------------

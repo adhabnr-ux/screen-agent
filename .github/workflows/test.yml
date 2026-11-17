@@ -91,6 +91,15 @@ jobs:
           & ${{ matrix.shell }} -NoProfile -Command '& ([scriptblock]::Create((Get-Content -Raw windows/agent.ps1)))'
           python test/check_report.py $env:MOCK_REPORT
           if (-not ((Get-Content -Raw $env:MOCK_REPORT) -match '"workspace": "wrkspc_016got19sMpunUQcnrvjLxHf"')) { Write-Error 'expected the built-in workspace'; exit 1 }
+      - name: Real typing and dragging (types into a text box, drags a window)
+        shell: pwsh
+        env:
+          SCREEN_AGENT_TASK: ''
+          MOCK_REPORT: ''
+          SCREEN_AGENT_BASE_URL: ''
+        run: |
+          & ${{ matrix.shell }} -NoProfile -File test\windows_real_input.ps1 -Shell ${{ matrix.shell }}
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
   linux:
     runs-on: ubuntu-latest
@@ -147,3 +156,15 @@ jobs:
           script -q /dev/null bash -c 'curl -fsSL $SCREEN_AGENT_REPO_RAW/run.sh | bash -s -- --here'
           python3 test/check_report.py "$MOCK_REPORT"
           grep -q '"workspace": "wrkspc_016got19sMpunUQcnrvjLxHf"' "$MOCK_REPORT"
+      - name: Real typing and dragging (TextEdit)
+        env:
+          SCREEN_AGENT_DRY_RUN: ''
+          SCREEN_AGENT_TASK: ''
+        run: REAL_INPUT_OUT="$RUNNER_TEMP/real-input" bash test/mac_real_input.sh
+      - name: Upload screenshots from the real-input test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-real-input
+          path: ${{ runner.temp }}/real-input
+          if-no-files-found: ignore

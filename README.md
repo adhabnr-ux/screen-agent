@@ -40,6 +40,13 @@ Then type what you want, for example:
 
 > Open a browser, go to wikipedia.org and find the population of Tucson.
 
+## What it looks like
+
+The pointer glides to each target along a slight curve, easing in and out, so you can follow
+where it's going. Drags move the same way with the button held. Text is typed one character at
+a time at a steady 110 words per minute. Claude is told to write clear, correct sentences with
+ordinary punctuation.
+
 ## Stop it
 
 - Move the mouse into the **top-left corner** of the screen. Claude stops before its next action.
@@ -88,6 +95,8 @@ PowerShell), then run the command:
 | `SCREEN_AGENT_MODEL` | `claude-sonnet-5-5` | Any Claude model with computer use, for example `claude-opus-5-5`. |
 | `SCREEN_AGENT_EFFORT` | `medium` | `low`, `medium`, `high`, `xhigh`, `max`: higher is more careful and costs more. |
 | `SCREEN_AGENT_FAST` | – | `1` = fast mode: quicker replies at about twice the price. Needs `SCREEN_AGENT_MODEL=claude-opus-5-5`; on other models it switches itself off. |
+| `SCREEN_AGENT_WPM` | `110` | Typing speed in words per minute. `0` = as fast as the computer accepts. |
+| `SCREEN_AGENT_SMOOTH` | – | `0` = the pointer jumps to each target instead of gliding. |
 | `SCREEN_AGENT_MODE` | – | `guide` = Claude sees the screen and tells you what to do, but never clicks or types. |
 | `SCREEN_AGENT_DRY_RUN` | – | `1` = take screenshots but don't click or type (for testing). |
 

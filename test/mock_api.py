@@ -10,6 +10,10 @@ Writes a JSON report to $MOCK_REPORT (default ./mock_report.json) after each req
 Options via env:
   MOCK_REJECT_BETA=1   reply 400 to any request carrying anthropic-beta (tests compat mode)
   MOCK_429_FIRST=1     reply 429 (retry-after: 1) to the first /v1/messages call
+  MOCK_SCRIPT=<file>   play this JSON instead of the built-in session: a list of turns, each a list of
+                       {"name": ..., "input": {...}} computer actions; after the last turn the mock ends.
+                       Results are checked only generically (pairing, toolset_name); "action_errors" in the
+                       report counts tool results that came back with is_error.
   MOCK_REJECT_SPEED=1  reply 400 to any request with "speed" in the body (tests the fast-mode fallback)
   MOCK_UNSCOPED=1      the key is organization-wide: requests need anthropic-workspace-id
                        (wrkspc_01TESTDEFAULT or wrkspc_01TESTSECOND); /v1/organizations/workspaces lists both
@@ -39,7 +43,7 @@ NEED_WS = {"type": "error", "error": {"type": "invalid_request_error", "message"
 REPORT = os.environ.get("MOCK_REPORT", "mock_report.json")
 INPUT_MEMBERS = ["left_click", "right_click", "middle_click", "double_click", "triple_click", "left_click_drag",
                  "mouse_move", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key"]
-state = {"guide": False, "speed": None, "speed_rejected": False, "workspace_seen": None, "calls": 0, "step": 0, "errors": [], "checks": [], "saw_429": False,
+state = {"action_errors": [], "guide": False, "speed": None, "speed_rejected": False, "workspace_seen": None, "calls": 0, "step": 0, "errors": [], "checks": [], "saw_429": False,
          "compat": False, "done": False, "image_sizes": []}
 
 
@@ -79,8 +83,19 @@ def tu(i, name, inp):
 SIG = "c2lnbmF0dXJl"  # fake signature, must be echoed back unchanged
 
 
+CUSTOM = None
+if os.environ.get("MOCK_SCRIPT"):
+    with open(os.environ["MOCK_SCRIPT"]) as _f:
+        CUSTOM = json.load(_f)
+
+
 def script(step):
     """Assistant content for each step of the scripted session."""
+    if CUSTOM is not None:
+        if step < len(CUSTOM):
+            return [{"type": "text", "text": "Step %d." % (step + 1)}] + \
+                   [tu(i, a["name"], a.get("input", {})) for i, a in enumerate(CUSTOM[step])], "tool_use"
+        return [{"type": "text", "text": "Done."}], "end_turn"
     if step == 0:
         return [{"type": "thinking", "thinking": "Looking at the screen first.", "signature": SIG},
                 {"type": "text", "text": "I'll take a screenshot to see the screen."},
@@ -138,6 +153,7 @@ def validate(body, headers):
         state["speed"] = body["speed"]
         check(body["speed"] == "fast", "speed is 'fast' when present")
     check("Work in batches" in body.get("system", "") or state["guide"], "system prompt has the batching guidance")
+    check("ordinary punctuation" in body.get("system", ""), "system prompt has the writing-style rule")
     check(body.get("thinking", {}).get("type") == "adaptive", "adaptive thinking")
     check("temperature" not in body and "top_p" not in body, "no sampling params")
     check(isinstance(body.get("system"), str) and "Screenshots are" in body["system"], "system prompt present")
@@ -235,6 +251,9 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def address_string(self):  # no reverse lookups
+        return self.client_address[0]
+
     def send(self, code, obj, extra=None):
         data = json.dumps(obj).encode()
         self.send_response(code)
@@ -310,7 +329,12 @@ class H(BaseHTTPRequestHandler):
             write_report()
             return self.send(*wp)
         msgs = validate(body, hdrs)
-        if state["step"] > 0:
+        if CUSTOM is not None:
+            last = msgs[-1]["content"] if msgs and msgs[-1]["role"] == "user" else []
+            for r in last:
+                if isinstance(r, dict) and r.get("type") == "tool_result" and r.get("is_error"):
+                    state["action_errors"].append(str(r.get("content"))[:200])
+        elif state["step"] > 0:
             check_results(msgs)
         content, stop = script(state["step"])
         state["step"] += 1
@@ -322,12 +346,23 @@ class H(BaseHTTPRequestHandler):
                         "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 10}})
 
 
+class Server(ThreadingHTTPServer):
+    """HTTPServer.server_bind looks up this machine's network name, which is slow and makes
+    macOS ask to "find devices on local networks". The mock only ever serves 127.0.0.1."""
+
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[0], self.server_address[1]
+
+
 def write_report():
     with open(REPORT, "w") as f:
         json.dump({"done": state["done"], "calls": state["calls"], "errors": state["errors"],
                    "passed": len(state["checks"]), "saw_429": state["saw_429"],
                    "compat": state["compat"], "workspace": state["workspace_seen"], "guide": state["guide"], "speed": state["speed"],
-                   "speed_rejected": state["speed_rejected"], "image_sizes": state["image_sizes"]}, f, indent=1)
+                   "speed_rejected": state["speed_rejected"], "action_errors": state["action_errors"],
+                   "custom": CUSTOM is not None, "image_sizes": state["image_sizes"]}, f, indent=1)
 
 
 if __name__ == "__main__":
@@ -337,4 +372,4 @@ if __name__ == "__main__":
     a = ap.parse_args()
     write_report()
     print(f"mock api on http://{a.host}:{a.port}", flush=True)
-    ThreadingHTTPServer((a.host, a.port), H).serve_forever()
+    Server((a.host, a.port), H).serve_forever()

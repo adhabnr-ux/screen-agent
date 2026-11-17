@@ -48,7 +48,7 @@ X.XQueryPointer(d,r,ctypes.byref(a),ctypes.byref(b),ctypes.byref(x),ctypes.byref
 }
 
 echo "=== 1. full scripted session, real XTest input on Xvfb 1920x1080"
-python3 /src/test/linux_keylog.py /tmp/keys.txt &
+python3 /src/test/linux_keylog.py /tmp/keys.txt /tmp/keytimes.txt &
 sleep 1
 start_mock 8701
 agent 8701 ANTHROPIC_API_KEY=sk-test-good SCREEN_AGENT_TASK=test > /tmp/out1.txt 2>&1; echo "exit=$?"
@@ -234,6 +234,82 @@ grep -qE "Number:|Paste the workspace ID" /tmp/out20.txt && fail "asked about a 
 report_ok 8718 "session after /key" || FAIL=1
 ws_is 8718 $DEFWS && pass "after /key requests carried the built-in default" || fail "workspace header"
 [ ! -e /tmp/h20/.screen-agent/workspace ] && pass "saved workspace forgotten, default not saved" || fail "workspace file still there"
+
+cursor_to() {  # $1 x $2 y (real pixels)
+  python3 -c '
+import ctypes, sys
+X=ctypes.CDLL("libX11.so.6"); T=ctypes.CDLL("libXtst.so.6")
+X.XOpenDisplay.restype=ctypes.c_void_p; X.XOpenDisplay.argtypes=[ctypes.c_char_p]; d=X.XOpenDisplay(None)
+T.XTestFakeMotionEvent.argtypes=[ctypes.c_void_p,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_ulong]
+T.XTestFakeMotionEvent(d,0,int(sys.argv[1]),int(sys.argv[2]),0); X.XSync.argtypes=[ctypes.c_void_p,ctypes.c_int]; X.XSync(d,0)' "$1" "$2"
+}
+
+echo "=== 21. pointer path math (pure function, no display)"
+env -u DISPLAY python3 /src/test/linux_pointer_check.py unit || FAIL=1
+
+echo "=== 22. real drag + gliding pointer, events recorded by an X window (Xvfb, real XTest)"
+# screenshot coords x1.5 = real pixels: drag (420,300)->(620,300) = (630,450)->(930,450); move to (960,500) = (1440,750)
+printf '%s' '[[{"name":"left_click_drag","input":{"start_coordinate":[420,300],"coordinate":[620,300]}}],[{"name":"mouse_move","input":{"coordinate":[960,500]}}],[{"name":"screenshot","input":{}}]]' > /tmp/drag.json
+python3 /src/test/linux_pointerlog.py /tmp/pointer.txt &
+PLOG=$!
+sleep 1
+cursor_to 960 540; sleep 0.3; : > /tmp/pointer.txt; : > /tmp/keys.txt
+start_mock 8719 MOCK_SCRIPT=/tmp/drag.json
+agent 8719 ANTHROPIC_API_KEY=sk-test-good SCREEN_AGENT_TASK=test > /tmp/out22.txt 2>&1; echo "exit=$?"
+cat /tmp/out22.txt
+report_ok 8719 "drag script session" || FAIL=1
+[ "$(field 8719 action_errors)" = "[]" ] && [ "$(field 8719 custom)" = true ] && pass "no action errors (custom script)" || fail "action_errors $(field 8719 action_errors)"
+sleep 0.3
+python3 /src/test/linux_pointer_check.py events /tmp/pointer.txt smooth 630 450 930 450 1440 750 || FAIL=1
+[ "$(cursor_now)" = 1440,750 ] && pass "pointer ended at the mouse_move target (1440,750)" || fail "final cursor $(cursor_now)"
+[ ! -s /tmp/keys.txt ] && pass "no stray key events during pointer actions" || fail "keys were sent"
+
+echo "=== 23. SCREEN_AGENT_SMOOTH=0: moves jump, drags still pass through >= 12 points"
+cursor_to 960 540; sleep 0.3; : > /tmp/pointer.txt
+start_mock 8720 MOCK_SCRIPT=/tmp/drag.json
+agent 8720 ANTHROPIC_API_KEY=sk-test-good SCREEN_AGENT_SMOOTH=0 SCREEN_AGENT_TASK=test > /tmp/out23.txt 2>&1; echo "exit=$?"
+report_ok 8720 "drag script session, no glide" || FAIL=1
+[ "$(field 8720 action_errors)" = "[]" ] && pass "no action errors" || fail "action_errors $(field 8720 action_errors)"
+sleep 0.3
+python3 /src/test/linux_pointer_check.py events /tmp/pointer.txt jump 630 450 930 450 1440 750 || FAIL=1
+
+echo "=== 24. dry run: nothing moves (guide mode is covered by tests 15-16)"
+cursor_to 960 540; sleep 0.3; : > /tmp/pointer.txt
+start_mock 8721 MOCK_SCRIPT=/tmp/drag.json
+agent 8721 ANTHROPIC_API_KEY=sk-test-good SCREEN_AGENT_DRY_RUN=1 SCREEN_AGENT_TASK=test > /tmp/out24.txt 2>&1; echo "exit=$?"
+report_ok 8721 "drag script, dry run" || FAIL=1
+sleep 0.3
+[ ! -s /tmp/pointer.txt ] && [ "$(cursor_now)" = 960,540 ] && pass "dry run: no pointer events, cursor still at 960,540" || fail "dry run moved the pointer"
+kill $PLOG 2>/dev/null
+
+echo "=== 25. typing speed: default 110 wpm, real key-press timestamps from the X server"
+TEXT="the quick brown fox jumps over the lazy dog"
+printf '[[{"name":"type","input":{"text":"%s"}}]]' "$TEXT" > /tmp/type.json
+cursor_to 960 540; sleep 0.3; : > /tmp/keys.txt; : > /tmp/keytimes.txt
+start_mock 8722 MOCK_SCRIPT=/tmp/type.json
+agent 8722 ANTHROPIC_API_KEY=sk-test-good SCREEN_AGENT_TASK=test > /tmp/out25.txt 2>&1; echo "exit=$?"
+report_ok 8722 "typing session, default speed" || FAIL=1
+sleep 0.3
+[ "$(cat /tmp/keys.txt)" = "$TEXT" ] && pass "text arrived intact at the default speed" || fail "typed text: $(cat /tmp/keys.txt)"
+cp /tmp/keytimes.txt /tmp/times_default.txt
+echo "--- same text with SCREEN_AGENT_WPM=0"
+: > /tmp/keys.txt; : > /tmp/keytimes.txt
+start_mock 8723 MOCK_SCRIPT=/tmp/type.json
+agent 8723 ANTHROPIC_API_KEY=sk-test-good SCREEN_AGENT_WPM=0 SCREEN_AGENT_TASK=test > /tmp/out25b.txt 2>&1; echo "exit=$?"
+report_ok 8723 "typing session, WPM=0" || FAIL=1
+sleep 0.3
+[ "$(cat /tmp/keys.txt)" = "$TEXT" ] && pass "text arrived intact with WPM=0" || fail "typed text: $(cat /tmp/keys.txt)"
+python3 /src/test/linux_typing_check.py speed /tmp/times_default.txt /tmp/keytimes.txt ${#TEXT} || FAIL=1
+python3 -c '
+import sys; sys.path.insert(0, "/src/linux"); import agent as a
+ok = [round(a.typing_pause(v), 4) for v in (None, "110", "0", "abc", "-5", "220")] == [0.1091, 0.1091, 0.0, 0.1091, 0.1091, 0.0545]
+print(("PASS" if ok else "FAIL") + ": SCREEN_AGENT_WPM parsing (unset/invalid/negative -> 110, 0 -> no pause, 220 -> 0.0545 s)"); sys.exit(0 if ok else 1)' || FAIL=1
+
+echo "=== 26. stop corner while a long text is being typed"
+cursor_to 960 540; sleep 0.3; : > /tmp/keys.txt
+(sleep 1.5; cursor_to 0 0) &
+SCREEN_AGENT_WPM=600 python3 /src/test/linux_typing_check.py stop /tmp/keys.txt 400 || FAIL=1
+cursor_to 960 540
 
 echo
 [ $FAIL = 0 ] && echo "ALL LINUX TESTS PASSED" || echo "SOME LINUX TESTS FAILED"

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Test helper: an X window that takes keyboard focus and logs typed characters to a file.
 
-  DISPLAY=:99 python3 test/linux_keylog.py /tmp/keys.txt
+  DISPLAY=:99 python3 test/linux_keylog.py /tmp/keys.txt [/tmp/keytimes.txt]
+
+With the second file, the X server time (ms) of each logged key press is appended to it, one per
+line. Truncate either file to start a new recording.
 """
 import ctypes
 import sys
 
 out = sys.argv[1]
+times = sys.argv[2] if len(sys.argv) > 2 else None
 X = ctypes.CDLL("libX11.so.6")
 X.XOpenDisplay.restype = ctypes.c_void_p
 X.XOpenDisplay.argtypes = [ctypes.c_char_p]
@@ -58,3 +62,6 @@ while True:
         ch = "<%x>" % k
     with open(out, "a", encoding="utf-8") as f:
         f.write(ch)
+    if times:
+        with open(times, "a") as f:
+            f.write("%d\n" % (ev[7] & 0xFFFFFFFF))  # XKeyEvent.time
