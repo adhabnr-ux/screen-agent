@@ -20,7 +20,7 @@ jobs:
       SCREEN_AGENT_TASK: test
       MOCK_REPORT: ${{ github.workspace }}\mock_report.json
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Start mock API and file server
         shell: pwsh
         run: |
@@ -60,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build test image (Xvfb + python3 + libXtst)
         run: docker build -t screen-agent-linux-test -f test/linux_Dockerfile test
       - name: Run Linux tests (real XTest input on a virtual display)
@@ -78,7 +78,7 @@ jobs:
       SCREEN_AGENT_REPO_RAW: http://127.0.0.1:8790
       MOCK_REPORT: ${{ github.workspace }}/mock_report.json
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Start mock API and file server
         run: |
           python3 test/mock_api.py --port 8765 &
