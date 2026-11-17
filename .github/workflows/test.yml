@@ -55,6 +55,42 @@ jobs:
             Start-Sleep 1
           }
           python test/check_report.py $env:MOCK_REPORT
+      - name: Guide mode (looks at the screen, never sends input)
+        shell: pwsh
+        env:
+          SCREEN_AGENT_MODE: guide
+          SCREEN_AGENT_BASE_URL: http://127.0.0.1:8767
+          MOCK_REPORT: ${{ github.workspace }}\mock_report3.json
+        run: |
+          Start-Process python -ArgumentList 'test/mock_api.py','--port','8767' -WindowStyle Hidden
+          Start-Sleep 2
+          & ${{ matrix.shell }} -NoProfile -Command '& ([scriptblock]::Create((Get-Content -Raw windows/agent.ps1)))'
+          python test/check_report.py $env:MOCK_REPORT
+      - name: Policy blocks the input layer -> continues in guide mode
+        shell: pwsh
+        env:
+          SCREEN_AGENT_TEST_NO_COMPILE: '1'
+          SCREEN_AGENT_BASE_URL: http://127.0.0.1:8768
+          MOCK_REPORT: ${{ github.workspace }}\mock_report4.json
+        run: |
+          Start-Process python -ArgumentList 'test/mock_api.py','--port','8768' -WindowStyle Hidden
+          Start-Sleep 2
+          & ${{ matrix.shell }} -NoProfile -Command '& ([scriptblock]::Create((Get-Content -Raw windows/agent.ps1)))'
+          python test/check_report.py $env:MOCK_REPORT
+          if (-not ((Get-Content -Raw $env:MOCK_REPORT) -match '"guide": true')) { Write-Error 'expected guide mode'; exit 1 }
+      - name: Organization-wide key uses the built-in workspace (no prompt)
+        shell: pwsh
+        env:
+          MOCK_UNSCOPED: '1'
+          MOCK_EXTRA_WORKSPACE: wrkspc_016got19sMpunUQcnrvjLxHf
+          SCREEN_AGENT_BASE_URL: http://127.0.0.1:8769
+          MOCK_REPORT: ${{ github.workspace }}\mock_report5.json
+        run: |
+          Start-Process python -ArgumentList 'test/mock_api.py','--port','8769' -WindowStyle Hidden
+          Start-Sleep 2
+          & ${{ matrix.shell }} -NoProfile -Command '& ([scriptblock]::Create((Get-Content -Raw windows/agent.ps1)))'
+          python test/check_report.py $env:MOCK_REPORT
+          if (-not ((Get-Content -Raw $env:MOCK_REPORT) -match '"workspace": "wrkspc_016got19sMpunUQcnrvjLxHf"')) { Write-Error 'expected the built-in workspace'; exit 1 }
 
   linux:
     runs-on: ubuntu-latest
@@ -88,3 +124,26 @@ jobs:
         run: script -q /dev/null bash -c 'curl -fsSL $SCREEN_AGENT_REPO_RAW/run.sh | bash -s -- --here'
       - name: Check mock report
         run: python3 test/check_report.py "$MOCK_REPORT"
+      - name: Guide mode
+        env:
+          SCREEN_AGENT_MODE: guide
+          SCREEN_AGENT_BASE_URL: http://127.0.0.1:8766
+          MOCK_REPORT: ${{ github.workspace }}/mock_report2.json
+        run: |
+          python3 test/mock_api.py --port 8766 &
+          sleep 2
+          script -q /dev/null bash -c 'curl -fsSL $SCREEN_AGENT_REPO_RAW/run.sh | bash -s -- --here'
+          python3 test/check_report.py "$MOCK_REPORT"
+          grep -q '"guide": true' "$MOCK_REPORT"
+      - name: Organization-wide key uses the built-in workspace (no prompt)
+        env:
+          MOCK_UNSCOPED: '1'
+          MOCK_EXTRA_WORKSPACE: wrkspc_016got19sMpunUQcnrvjLxHf
+          SCREEN_AGENT_BASE_URL: http://127.0.0.1:8767
+          MOCK_REPORT: ${{ github.workspace }}/mock_report3.json
+        run: |
+          python3 test/mock_api.py --port 8767 &
+          sleep 2
+          script -q /dev/null bash -c 'curl -fsSL $SCREEN_AGENT_REPO_RAW/run.sh | bash -s -- --here'
+          python3 test/check_report.py "$MOCK_REPORT"
+          grep -q '"workspace": "wrkspc_016got19sMpunUQcnrvjLxHf"' "$MOCK_REPORT"

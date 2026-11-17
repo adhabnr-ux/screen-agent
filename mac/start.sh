@@ -10,12 +10,12 @@ mkdir -p "$DIR/tmp"
 printf '\033]0;Screen Agent\007'
 
 # Sets KEY_CODE (HTTP status) and KEY_BODY for GET /v1/models with key $1.
-# The key goes through a pipe, never the command line.
+# The key goes through a pipe, never the command line. No workspace header is sent: this only
+# checks the key itself (an organization-wide key answers 400 "workspace", which means it's valid).
 check_key() {
-  local out ws=""
-  [ -n "${ANTHROPIC_WORKSPACE_ID:-}" ] && ws="header = \"anthropic-workspace-id: $ANTHROPIC_WORKSPACE_ID\""
+  local out
   out="$(curl -sS -w '\n%{http_code}' --connect-timeout 15 --max-time 30 \
-    -K <(printf 'header = "x-api-key: %s"\nheader = "anthropic-version: 2026-10-21"\n%s\n' "$1" "$ws") \
+    -K <(printf 'header = "x-api-key: %s"\nheader = "anthropic-version: 2026-10-21"\n' "$1") \
     "$BASE/v1/models?limit=1" 2>/dev/null)"
   KEY_CODE="${out##*$'\n'}"
   KEY_BODY="${out%$'\n'*}"
@@ -36,7 +36,7 @@ get_key() {
     case "$KEY_CODE" in
       200) echo "Key works."; break ;;
       400) case "$KEY_BODY" in
-             *workspace*) echo "Key works. It covers your whole organization, so you'll pick a workspace next."; break ;;
+             *workspace*) echo "Key works."; break ;;
              *) echo "The API didn't accept that key: $KEY_BODY" ;;
            esac ;;
       401|403) echo "That key was rejected. Check it and try again." ;;

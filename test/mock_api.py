@@ -10,8 +10,11 @@ Writes a JSON report to $MOCK_REPORT (default ./mock_report.json) after each req
 Options via env:
   MOCK_REJECT_BETA=1   reply 400 to any request carrying anthropic-beta (tests compat mode)
   MOCK_429_FIRST=1     reply 429 (retry-after: 1) to the first /v1/messages call
+  MOCK_REJECT_SPEED=1  reply 400 to any request with "speed" in the body (tests the fast-mode fallback)
   MOCK_UNSCOPED=1      the key is organization-wide: requests need anthropic-workspace-id
                        (wrkspc_01TESTDEFAULT or wrkspc_01TESTSECOND); /v1/organizations/workspaces lists both
+  MOCK_EXTRA_WORKSPACE=<id>  with MOCK_UNSCOPED: also accept this workspace ID (not listed)
+  MOCK_SCOPED_STRICT=1 the key is tied to one workspace: any anthropic-workspace-id header gets 403
   MOCK_UNSCOPED=nolist same, but listing workspaces returns 403 (user must paste the ID)
 """
 import argparse
@@ -28,11 +31,15 @@ WORKSPACES = [{"id": "wrkspc_01TESTDEFAULT", "type": "workspace", "name": "Defau
               {"id": "wrkspc_01TESTSECOND", "type": "workspace", "name": "Research", "archived_at": None},
               {"id": "wrkspc_01TESTARCHIVED", "type": "workspace", "name": "Old", "archived_at": "2026-01-01T00:00:00Z"}]
 LIVE_IDS = [w["id"] for w in WORKSPACES if not w["archived_at"]]
+if os.environ.get("MOCK_EXTRA_WORKSPACE"):
+    LIVE_IDS.append(os.environ["MOCK_EXTRA_WORKSPACE"])
 NEED_WS = {"type": "error", "error": {"type": "invalid_request_error", "message":
            "This API key is not scoped to a workspace, so this request must include the anthropic-workspace-id "
            "header with the ID of the workspace to use. Add the header, or use an API key that is scoped to a workspace."}}
 REPORT = os.environ.get("MOCK_REPORT", "mock_report.json")
-state = {"workspace_seen": None, "calls": 0, "step": 0, "errors": [], "checks": [], "saw_429": False,
+INPUT_MEMBERS = ["left_click", "right_click", "middle_click", "double_click", "triple_click", "left_click_drag",
+                 "mouse_move", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key"]
+state = {"guide": False, "speed": None, "speed_rejected": False, "workspace_seen": None, "calls": 0, "step": 0, "errors": [], "checks": [], "saw_429": False,
          "compat": False, "done": False, "image_sizes": []}
 
 
@@ -78,6 +85,8 @@ def script(step):
         return [{"type": "thinking", "thinking": "Looking at the screen first.", "signature": SIG},
                 {"type": "text", "text": "I'll take a screenshot to see the screen."},
                 tu(0, "screenshot", {})], "tool_use"
+    if state["guide"] and step >= 1:
+        return [{"type": "text", "text": "Click the Apple menu in the top-left corner, then tell me when it's open."}], "end_turn"
     if step == 1:
         return [{"type": "text", "text": "Running a batch of actions."},
                 tu(0, "mouse_move", {"coordinate": [200, 150]}),
@@ -99,6 +108,13 @@ def script(step):
                 tu(16, "middle_click", {"coordinate": [60, 60]}),
                 tu(17, "frobnicate", {}),
                 tu(18, "screenshot", {})], "tool_use"
+    if step == 2:  # batch without a trailing screenshot: the agent must attach one itself
+        return [{"type": "text", "text": "Typing into the field."},
+                tu(0, "left_click", {"coordinate": [300, 300]}),
+                tu(1, "type", {"text": "abc"})], "tool_use"
+    if step == 3:  # batch that ends with screenshot: nothing extra attached
+        return [tu(0, "key", {"text": "Return"}),
+                tu(1, "screenshot", {})], "tool_use"
     return [{"type": "thinking", "thinking": "", "signature": SIG},
             {"type": "text", "text": "Done. I ran every action in the test batch."}], "end_turn"
 
@@ -109,7 +125,19 @@ def validate(body, headers):
     check(body.get("model"), "model set")
     check(body.get("max_tokens", 0) >= 1024, "max_tokens >= 1024")
     tools = body.get("tools")
-    check(tools == [{"type": "computer_toolset_20260801"}], "tools is exactly the computer toolset")
+    ok_tools = isinstance(tools, list) and len(tools) == 1 and tools[0].get("type") == "computer_toolset_20260801" \
+        and set(tools[0]) <= {"type", "configs"}
+    check(ok_tools, "tools is exactly the computer toolset")
+    if ok_tools and "configs" in tools[0]:
+        cfg = tools[0]["configs"]
+        state["guide"] = True
+        check(sorted(cfg) == sorted(INPUT_MEMBERS) and all(v == {"enabled": False} for v in cfg.values()),
+              "guide mode disables exactly the 13 input members")
+        check("cannot control it" in body.get("system", ""), "guide-mode system prompt")
+    if "speed" in body:
+        state["speed"] = body["speed"]
+        check(body["speed"] == "fast", "speed is 'fast' when present")
+    check("Work in batches" in body.get("system", "") or state["guide"], "system prompt has the batching guidance")
     check(body.get("thinking", {}).get("type") == "adaptive", "adaptive thinking")
     check("temperature" not in body and "top_p" not in body, "no sampling params")
     check(isinstance(body.get("system"), str) and "Screenshots are" in body["system"], "system prompt present")
@@ -178,6 +206,29 @@ def check_results(msgs):
         r = res["toolu_1_18"]
         check(r.get("is_error") is True and "Not executed" in str(r.get("content")),
               "action after a failure -> Not executed")
+        for k in list(range(0, 9)) + list(range(10, 17)):
+            c = res[f"toolu_1_{k}"].get("content")
+            check(not (isinstance(c, list) and any(b.get("type") == "image" for b in c)),
+                  f"toolu_1_{k}: no screenshot attached to a failed batch")
+
+    def kinds(r):
+        c = r.get("content")
+        return [b.get("type") for b in c] if isinstance(c, list) else ["text"]
+
+    if state["step"] == 3 and not state["guide"]:
+        check(kinds(res["toolu_2_0"]) == ["text"], "auto-screenshot: first result of the batch is plain OK")
+        r = res["toolu_2_1"]
+        check(kinds(r) == ["text", "text", "image"] and not r.get("is_error"),
+              f"auto-screenshot: last result is [OK, label, image] (got {kinds(r)})")
+        if kinds(r)[-1:] == ["image"]:
+            check(r["content"][1]["text"] == "Screenshot after these actions:", "auto-screenshot label text")
+            src = r["content"][2]["source"]
+            w, h = image_size(src["data"], src["media_type"])
+            state["image_sizes"].append(["auto", w, h])
+            check(w <= 1280 and h <= 800, f"auto-screenshot {w}x{h} fits 1280x800")
+    if state["step"] == 4 and not state["guide"]:
+        check(kinds(res["toolu_3_0"]) == ["text"], "batch ending in screenshot: nothing attached to the key result")
+        check(kinds(res["toolu_3_1"]) == ["image"], "batch ending in screenshot: screenshot result is one image")
 
 
 class H(BaseHTTPRequestHandler):
@@ -197,6 +248,9 @@ class H(BaseHTTPRequestHandler):
     def workspace_problem(self):
         """None if the workspace header is fine for this key, else (code, body) to send."""
         ws = self.headers.get("anthropic-workspace-id")
+        if os.environ.get("MOCK_SCOPED_STRICT") and ws:
+            return 403, {"type": "error", "error": {"type": "permission_error",
+                                                    "message": "This API key cannot be used with the requested workspace."}}
         if not UNSCOPED:
             return None
         if not ws:
@@ -246,6 +300,10 @@ class H(BaseHTTPRequestHandler):
         if os.environ.get("MOCK_REJECT_BETA"):
             state["compat"] = True
             check("fallbacks" not in body, "compat mode drops fallbacks")
+        if os.environ.get("MOCK_REJECT_SPEED") and "speed" in body:
+            state["speed_rejected"] = True
+            return self.send(400, {"type": "error", "error": {"type": "invalid_request_error",
+                                                              "message": "speed: fast mode is not available for this organization"}})
         wp = self.workspace_problem()
         if wp:
             check(False, "messages request without a valid anthropic-workspace-id for an unscoped key")
@@ -268,7 +326,8 @@ def write_report():
     with open(REPORT, "w") as f:
         json.dump({"done": state["done"], "calls": state["calls"], "errors": state["errors"],
                    "passed": len(state["checks"]), "saw_429": state["saw_429"],
-                   "compat": state["compat"], "workspace": state["workspace_seen"], "image_sizes": state["image_sizes"]}, f, indent=1)
+                   "compat": state["compat"], "workspace": state["workspace_seen"], "guide": state["guide"], "speed": state["speed"],
+                   "speed_rejected": state["speed_rejected"], "image_sizes": state["image_sizes"]}, f, indent=1)
 
 
 if __name__ == "__main__":

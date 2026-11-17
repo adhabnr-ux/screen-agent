@@ -10,7 +10,7 @@ except Exception as e:  # noqa
     print(f"FAIL: no readable report at {path}: {e}")
     sys.exit(1)
 print(json.dumps(r, indent=1))
-if r.get("done") and not r.get("errors") and r.get("passed", 0) >= 70:
+if r.get("done") and not r.get("errors") and r.get("passed", 0) >= (5 if r.get("guide") else 100):
     print("PASS")
     sys.exit(0)
 print("FAIL")

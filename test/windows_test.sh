@@ -46,6 +46,10 @@ code=$(psonly windows/agent.ps1 windows/run.ps1)
 lint=$(echo "$code" | grep -E '\?\?|\?\.|&&|\|\||-AsHashtable|ForEach-Object -Parallel|Get-Error|-SkipCertificateCheck|ConvertFrom-Json -Depth')
 tern=$(echo "$code" | grep -E '\) \? [^:]+ : ')
 [ -z "$lint$tern" ] && pass "no PowerShell 7-only syntax" || { bad "PS7-only syntax"; echo "$lint$tern"; }
+[ "$(grep -c 'Add-Type -TypeDefinition' windows/agent.ps1)" = 1 ] && ! grep -qE 'Reflection\.Emit|DefinePInvokeMethod|DllImport' <(echo "$code") \
+  && pass "exactly one C# compile site; no other route to native input" || bad "extra compile/native route"
+out=$("$PWSH" -NoProfile -File test/windows_json_test.ps1 "$PWD/windows/agent.ps1" 2>&1)
+[ $? -eq 0 ] && pass "pure-PowerShell JSON extractor ($(echo "$out" | grep -c '^ok') checks)" || { bad "JSON extractor"; echo "$out"; }
 nonascii=$(python3 -c "import sys;[print(f,i+1) for f in sys.argv[1:] for i,l in enumerate(open(f,encoding='utf-8')) if any(ord(c)>127 for c in l)]" windows/agent.ps1 windows/run.ps1)
 [ -z "$nonascii" ] && pass "scripts are ASCII" || { bad "non-ASCII characters"; echo "$nonascii"; }
 
@@ -63,7 +67,7 @@ run_case() {  # name, mock-env, launch-mode (file|scriptblock); stdin text in $S
   tmo 120 env ${AGENT_ENV:-} APPDATA="$T/appdata-$name" SCREEN_AGENT_BASE_URL="http://127.0.0.1:$port" ANTHROPIC_API_KEY=sk-test-good \
   SCREEN_AGENT_TASK="Run the test batch" SCREEN_AGENT_TEST_STUB="$PWD/test/windows_stub.ps1" \
   SCREEN_AGENT_STUB_JPEG="$T/screen.jpg" SCREEN_AGENT_STUB_LOG="$stub" SCREEN_AGENT_STUB_CURSOR="${STUB_CURSOR:-500,500}" \
-    "$PWSH" -NoProfile -NonInteractive -Command "$launch" <"$T/$name.stdin" >"$log" 2>&1
+    "$PWSH" -NoProfile -NonInteractive -Command "$launch; if ('ScreenAgentWin1' -as [type]) { 'INPUT-LAYER-COMPILED' } else { 'INPUT-LAYER-NOT-COMPILED' }" <"$T/$name.stdin" >"$log" 2>&1
   local rc=$?
   kill $mpid 2>/dev/null; wait $mpid 2>/dev/null
   echo "---- $name (exit $rc) agent output:"; sed 's/^/  | /' "$log"
@@ -74,13 +78,15 @@ check_report() {  # name, extra python condition
   python3 - "$T/$1.json" "$2" <<'EOF'
 import json, sys
 r = json.load(open(sys.argv[1]))
-ok = r["done"] and not r["errors"] and eval(sys.argv[2] or "True")
+ok = r["done"] and not r["errors"] and r.get("passed", 0) >= (5 if r.get("guide") else 100) and eval(sys.argv[2] or "True")
 sys.exit(0 if ok else 1)
 EOF
 }
 
 run_case normal "" scriptblock
-check_report normal "" && pass "full session via scriptblock launch (as run.ps1 does)" || bad "normal session"
+check_report normal "r['calls']==5 and not r['guide'] and r['speed'] is None" && grep -q "Model claude-sonnet-5-5 " "$T/normal.log" && grep -qx "INPUT-LAYER-COMPILED" "$T/normal.log" && pass "full 5-call session via scriptblock launch (as run.ps1 does), default model claude-sonnet-5-5" || bad "normal session"
+check_report normal "['auto',1280,720] in r['image_sizes']" && [ "$(grep -c 'capture 0,0 1920x1080 -> 1280x720' "$T/normal.stub")" = 3 ] \
+  && pass "auto-screenshot attached to the clean batch only (3 full captures: 2 asked + 1 automatic)" || bad "auto-screenshot: $(grep -c 'capture 0,0 1920x1080' "$T/normal.stub") full captures"
 grep -q "type héllo wörld\\\\nline2" "$T/normal.stub" && pass "unicode text reached the type layer intact" || bad "typed text mangled: $(grep '^type' "$T/normal.stub")"
 grep -q "capture 0,0 1920x1080 -> 1280x720" "$T/normal.stub" && pass "screenshot scaled 1920x1080 -> 1280x720" || bad "screenshot scaling"
 grep -q "capture 0,0 600x375 -> 1152x720" "$T/normal.stub" && pass "zoom region mapped to 600x375 screen px, fit to 1152x720" || bad "zoom mapping: $(grep 'capture' "$T/normal.stub")"
@@ -112,7 +118,56 @@ AGENT_ENV="ANTHROPIC_WORKSPACE_ID=wrkspc_01TESTSECOND" run_case ws_env "MOCK_UNS
 check_report ws_env "r['workspace']=='wrkspc_01TESTSECOND'" && ! grep -qE "Number:|Paste the workspace|several workspaces" "$T/ws_env.log" \
   && pass "ANTHROPIC_WORKSPACE_ID: header sent, no prompt" || bad "workspace env override"
 
-# --- 6. launcher -------------------------------------------------------------------------------
+DEFWS=wrkspc_016got19sMpunUQcnrvjLxHf
+run_case ws_default "MOCK_UNSCOPED=1 MOCK_EXTRA_WORKSPACE=$DEFWS" file
+check_report ws_default "r['workspace']=='$DEFWS'" && ! grep -qE "Number:|Paste the workspace|several workspaces|workspace" "$T/ws_default.log" \
+  && [ ! -e "$T/appdata-ws_default/screen-agent/workspace.txt" ] \
+  && pass "built-in default workspace: used without a prompt, never written to workspace.txt" || bad "built-in default workspace"
+
+run_case ws_strict "MOCK_SCOPED_STRICT=1" file
+check_report ws_strict "r['workspace'] is None" && ! grep -qi "workspace" "$T/ws_strict.log" \
+  && [ ! -e "$T/appdata-ws_strict/screen-agent/workspace.txt" ] \
+  && pass "key tied to one workspace: built-in default dropped quietly, no header sent" || bad "scoped-strict key"
+
+# mid-session: startup check passes, /v1/messages rejects the built-in default -> drop it, retry once
+port=$((20000 + RANDOM % 20000)); MOCK_REPORT="$T/wsmid.json" python3 test/windows_ws_midsession_mock.py $port >/dev/null 2>&1 & mpid=$!
+for _ in $(seq 50); do curl -s "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1 && break; sleep 0.1; done
+mkdir -p "$T/appdata-wsmid"
+tmo 120 env APPDATA="$T/appdata-wsmid" SCREEN_AGENT_BASE_URL="http://127.0.0.1:$port" ANTHROPIC_API_KEY=sk-test-good SCREEN_AGENT_TASK="hello" \
+  SCREEN_AGENT_TEST_STUB="$PWD/test/windows_stub.ps1" SCREEN_AGENT_STUB_JPEG="$T/screen.jpg" \
+  "$PWSH" -NoProfile -NonInteractive -File windows/agent.ps1 </dev/null >"$T/wsmid.log" 2>&1
+kill $mpid 2>/dev/null; wait $mpid 2>/dev/null
+echo "---- wsmid agent output:"; sed 's/^/  | /' "$T/wsmid.log"; echo "---- wsmid mock report:"; cat "$T/wsmid.json"; echo
+python3 -c "import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r['posts']==['$DEFWS', None] else 1)" "$T/wsmid.json" \
+  && grep -q "Nothing to do." "$T/wsmid.log" && ! grep -qi "error\|workspace" "$T/wsmid.log" && [ ! -e "$T/appdata-wsmid/screen-agent/workspace.txt" ] \
+  && pass "mid-session: built-in default rejected by /v1/messages -> dropped, retried once with no header" || bad "mid-session default drop"
+
+# --- 6. fast mode and guide mode ----------------------------------------------------------------
+AGENT_ENV="SCREEN_AGENT_FAST=1" run_case fast "" file
+check_report fast "r['speed']=='fast' and not r['speed_rejected']" && pass "SCREEN_AGENT_FAST=1 sends speed: fast" || bad "fast mode"
+
+AGENT_ENV="SCREEN_AGENT_FAST=1" run_case fast_rej "MOCK_REJECT_SPEED=1" file
+check_report fast_rej "r['speed_rejected'] and r['speed'] is None" && grep -q "Fast mode isn't available for this key or model; continuing at normal speed." "$T/fast_rej.log" \
+  && pass "rejected speed: fast mode turned off, request retried, session done" || bad "fast mode fallback"
+
+AGENT_ENV="SCREEN_AGENT_MODE=guide" run_case guide "" file
+check_report guide "r['guide'] and r['calls']==2" && grep -q "Screen Agent (guide mode)" "$T/guide.log" \
+  && ! grep -qE "^(move|mouse|key|type)" "$T/guide.stub" && [ "$(grep -c '^capture' "$T/guide.stub")" = 1 ] \
+  && grep -qx "INPUT-LAYER-NOT-COMPILED" "$T/guide.log" \
+  && pass "guide mode: 13 input members disabled, guide prompt + banner, zero input events, no auto-screenshot, no C# compiled" || bad "guide mode"
+
+AGENT_ENV="SCREEN_AGENT_TEST_NO_COMPILE=1" run_case nocompile "" file
+check_report nocompile "r['guide'] and r['calls']==2" \
+  && grep -qF "This computer's policy doesn't let Screen Agent control the mouse and keyboard. Continuing in guide mode: Claude sees the screen and tells you what to click." "$T/nocompile.log" \
+  && grep -q "Screen Agent (guide mode)" "$T/nocompile.log" && grep -qx "INPUT-LAYER-NOT-COMPILED" "$T/nocompile.log" \
+  && ! grep -qE "^(move|mouse|key|type)" "$T/nocompile.stub" \
+  && pass "compile blocked: policy message, falls back to guide mode, zero input events" || bad "compile-blocked fallback"
+
+AGENT_ENV="SCREEN_AGENT_DRY_RUN=1" run_case dry "" file
+check_report dry "['auto',1280,720] in r['image_sizes']" && ! grep -qE "^(move|mouse|key|type)" "$T/dry.stub" \
+  && pass "dry run: zero input events, auto-screenshot still attached" || bad "dry run"
+
+# --- 7. launcher -------------------------------------------------------------------------------
 cmd=$(SCREEN_AGENT_LAUNCH_PRINT=1 SCREEN_AGENT_REPO_RAW="http://127.0.0.1:1/x" "$PWSH" -NoProfile -File windows/run.ps1)
 echo "$cmd" | grep -q '"' && bad "launcher command contains a double quote" || pass "launcher command has no double quotes"
 out=$("$PWSH" -NoProfile -Command "\$e=\$null;\$t=\$null;[void][System.Management.Automation.Language.Parser]::ParseInput(@'

@@ -9,10 +9,12 @@ implement this same behavior. Nothing may be installed: only what ships with the
 |---|---|---|
 | `ANTHROPIC_API_KEY` | – | If set, used and never saved. |
 | `SCREEN_AGENT_BASE_URL` | `https://api.anthropic.com` | Test against `test/mock_api.py`. |
-| `SCREEN_AGENT_MODEL` | `claude-opus-5-5` | |
+| `SCREEN_AGENT_MODEL` | `claude-sonnet-5-5` | |
 | `SCREEN_AGENT_EFFORT` | `medium` | `low` `medium` `high` `xhigh` `max` |
 | `SCREEN_AGENT_DRY_RUN` | unset | `1` = log input actions, send no mouse/keyboard events (screenshots still real). |
 | `ANTHROPIC_WORKSPACE_ID` | unset | Workspace for organization-wide keys (see Workspace). |
+| `SCREEN_AGENT_FAST` | unset | `1` = fast mode (see Speed). |
+| `SCREEN_AGENT_MODE` | unset | `guide` = guide mode (see Guide mode). |
 | `SCREEN_AGENT_TASK` | unset | Run this one task non-interactively, then exit (used by tests). |
 
 ## API key
@@ -33,6 +35,16 @@ Some keys aren't tied to one workspace; every request with such a key must carry
 
 - `ANTHROPIC_WORKSPACE_ID` env var overrides; otherwise the saved ID: `~/.screen-agent/workspace`
   (0600) on macOS/Linux, `%APPDATA%\screen-agent\workspace.txt` on Windows.
+- **Built-in default.** Each agent has a constant `DEFAULT_WORKSPACE = wrkspc_016got19sMpunUQcnrvjLxHf`
+  (the repo owner's workspace, public on purpose). It is used when neither the env var nor the
+  saved file gives an ID, so people using the owner's keys are never asked for a workspace.
+  It is a soft default: if the startup check returns 400, 403 or 404 while only the built-in
+  default is in use (the key belongs elsewhere), drop it, send no workspace header, and run the
+  startup check again; then continue as usual (200 → go on; workspace error → workspace setup).
+  Never write the built-in default to the saved file. After `/key`, the default applies again.
+  Same rule mid-session: if a `/v1/messages` call returns 400, 403 or 404 whose message mentions
+  `workspace` while the built-in default is in use, drop the default and retry that request once
+  with no workspace header (before considering workspace setup).
 - When a workspace ID is known, send `anthropic-workspace-id: <id>` on EVERY request (models, messages).
 - **Startup check** (after the key is known, before the banner): `GET /v1/models?limit=1`.
   If it returns 400 or 404 and the error message mentions `workspace` (404 = the saved workspace
@@ -68,7 +80,7 @@ anthropic-workspace-id: <id>      (only when a workspace ID is known)
 Body (key order irrelevant):
 ```json
 {
-  "model": "claude-opus-5-5",
+  "model": "claude-sonnet-5-5",
   "max_tokens": 16000,
   "system": "<SYSTEM PROMPT below>",
   "thinking": {"type": "adaptive", "display": "updates"},
@@ -89,6 +101,45 @@ with `"thinking": {"type": "adaptive"}`; stay in compat mode for the rest of the
 `error.message` and end the task.
 
 HTTP timeout: 600 s.
+
+## Speed
+
+- **Automatic screenshot.** After running a turn's `tool_use` blocks: if nothing failed or was
+  stopped, the last block is not `screenshot`, and at least one block was an input action or
+  `wait`, then wait 0.4 s, take a screenshot, and append two blocks to the LAST result's content:
+  `{"type":"text","text":"Screenshot after these actions:"}` and the image block. (So a batch
+  `[left_click, type]` returns `OK` for the click and `[OK text, label text, image]` for the type.)
+  This also applies in dry run. It saves the round trip Claude would spend asking for a screenshot.
+- **Fast mode.** When on (`SCREEN_AGENT_FAST=1`, or toggled with the `/fast` command), add
+  `"speed": "fast"` to the request body. `/fast` prints `Fast mode on (quicker replies, about twice the price).`
+  or `Fast mode off.` Fast mode exists only on some models (`claude-opus-5-5`; not the default
+  `claude-sonnet-5-5`). If a request returns 400 while fast mode is on and the error isn't the
+  workspace or compat case, turn fast mode off, print
+  `Fast mode isn't available for this key or model; continuing at normal speed.` and retry once.
+
+## Guide mode
+
+For computers where Screen Agent may look but not control (or when `SCREEN_AGENT_MODE=guide`).
+Claude sees the screen and tells the person what to click; it never sends input.
+
+- Tools entry: `{"type":"computer_toolset_20260801","configs":{<member>:{"enabled":false}, ...}}`
+  with all 13 input members disabled: `left_click right_click middle_click double_click
+  triple_click left_click_drag mouse_move left_mouse_down left_mouse_up scroll type key hold_key`.
+  `screenshot`, `zoom`, `wait`, `cursor_position` stay on.
+- If Claude calls a disabled member anyway: `is_error`,
+  `"Guide mode: Screen Agent can't control this computer. Tell the person what to do instead."`
+- Banner: `Screen Agent (guide mode) — Claude can see the screen and tells you what to do. It can't click or type here.`
+- No failsafe check, no automatic screenshot.
+- System prompt: the "How to work" section is replaced by the guide text (see System prompt).
+- macOS enters guide mode on its own when Accessibility isn't granted but Screen Recording is
+  (see mac/agent.js `checkPermissions`).
+- Windows: guide mode must not compile any C# (`Add-Type -TypeDefinition`); it uses only framework
+  assemblies (`System.Drawing`, `System.Windows.Forms`) for capture, screen size and cursor position.
+  In control mode, if compiling the input layer fails (a device policy can block it), print
+  `This computer's policy doesn't let Screen Agent control the mouse and keyboard. Continuing in guide mode: Claude sees the screen and tells you what to click.`
+  and switch to guide mode. Never try another way to send input. Constrained Language Mode still
+  ends with the existing policy message (nothing can run there).
+- Linux: only via the env var.
 
 ## Response handling
 
@@ -178,7 +229,7 @@ Do this instead of sending the tool results (never leave unmatched tool_use bloc
 ## Terminal UI
 
 Banner: `Screen Agent — Claude controls this computer. Move the mouse to the top-left corner or press Ctrl+C to stop.`
-Prompt: `\nWhat should I do? > ` . Commands: `/new` (fresh conversation), `/key`, `/quit`, `/help`.
+Prompt: `\nWhat should I do? > ` . Commands: `/new` (fresh conversation), `/key`, `/fast`, `/quit`, `/help`.
 Print each action as `  → left_click (512, 300)` (screenshot coords).
 
 ## System prompt
@@ -187,7 +238,9 @@ Print each action as `  → left_click (512, 300)` (screenshot coords).
 You are Screen Agent, operating a {OS_NAME} computer for the person at its keyboard through the computer tools. Screenshots are {sw}x{sh} pixels; all coordinates you give are in that space.
 
 How to work:
-- Start by taking a screenshot. After any action that changes the screen, take another to check it worked before moving on.
+- Start by taking a screenshot.
+- Work in batches: when you're confident of the next few steps, send them together in one turn (for example click a field, type, press Return). A fresh screenshot is attached automatically to the last result of each batch, so don't add a screenshot call at the end. Call screenshot yourself only to look again, for example after a wait.
+- Check that screenshot before continuing. If something didn't work, try another way.
 - Prefer reliable keyboard shortcuts.{OS_HINT}
 - Keep the person informed in one short line before each step, and finish with a brief summary of what you did.
 
@@ -197,6 +250,18 @@ Rules:
 - Never type passwords, payment card numbers, or other credentials. Ask the person to type them, then continue.
 - Don't try to get around security software, admin restrictions, content filters, CAPTCHAs, or monitoring. If something is blocked, say so.
 ```
+In guide mode the first paragraph's first sentence ends "...for the person at its keyboard. You can
+see the screen but cannot control it." (drop "through the computer tools"), and the "How to work"
+section is:
+```
+How to work:
+- You can take screenshots and zoom, but you cannot click or type on this computer. The person does that.
+- Take a screenshot, then tell the person exactly what to do: one or two steps at a time, naming what to click and where it is on the screen. Then end your turn and wait.
+- When they reply (for example "done"), take a new screenshot to check before giving the next step.
+- Finish with a brief summary.
+```
+The Rules section is unchanged.
+
 `OS_HINT`:
 - Windows: ` Open apps with the Windows key, type the name, press Return. Shortcuts use ctrl.`
 - macOS: ` Open apps with cmd+space (Spotlight), type the name, press Return. Shortcuts use cmd (super), not ctrl.`
