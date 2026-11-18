@@ -235,6 +235,41 @@ The person watching should be able to follow the pointer, so it glides instead o
   exactly like the failsafe (this result and the rest get the "Stopped: ..." error).
 - No pauses and no stop-corner checks in dry run. `key` and `hold_key` are not slowed.
 
+## Browser mode (Linux agent only: `linux/browser.py`)
+
+For machines where the desktop can't be controlled but a Linux shell can run: a Chromebook's Linux
+container (where VS Code and the Cline extension run), GitHub Codespaces, or a Linux box with no
+desktop. `run.sh` picks it on its own there (`/dev/.cros_milestone`, `/opt/google/cros-containers`,
+`CODESPACES=true`, or no `DISPLAY`/`WAYLAND_DISPLAY`), or with `--browser`; it sets
+`SCREEN_AGENT_MODE=browser` and runs in the current terminal.
+
+- Claude drives its own Chromium through the Chrome DevTools Protocol (stdlib websocket client),
+  never the person's own browser or the desktop. Nothing is installed or downloaded. Chromium is
+  found in this order: `SCREEN_AGENT_CHROME`; `google-chrome`, `google-chrome-stable`, `chromium`,
+  `chromium-browser`, `chrome` on PATH; the copy the Cline extension downloads into VS Code's global
+  storage (`<storage>/saoudrizwan.claude-dev/puppeteer/.chromium-browser-snapshots/...`); the
+  Puppeteer and Playwright caches. None → a message telling the person to let Cline open its
+  browser once (that downloads it) or set `SCREEN_AGENT_CHROME`; exit 2.
+- Launch flags include `--password-store=basic --use-mock-keychain` so the browser never asks the
+  system keychain or keyring for anything. Profile: `~/.screen-agent/browser-profile` (logins persist).
+  With a display (not Codespaces) the window is visible; otherwise it runs headless, and if a
+  visible window can't start it falls back to headless. If Chromium's sandbox can't start (common
+  in containers), retry once with `--no-sandbox` and say so.
+- The page is fixed at 1280x800 CSS px (`Emulation.setDeviceMetricsOverride`); screenshots are the
+  page only, at 1:1, so no coordinate scaling.
+- Tools: the computer toolset plus a custom tool `browser` (`action`: navigate, back, forward,
+  reload, new_tab, switch_tab, close_tab, list_tabs; `url`; `tab`). Every result is the tab list,
+  current tab marked `*`. Its `tool_result` has NO `toolset_name` (only toolset members echo it).
+  A batch containing `browser` actions also gets the automatic screenshot.
+- Same pointer glide, typing speed and key handling as the desktop agents, sent as DevTools mouse
+  and key events. A drawn pointer (an SVG arrow with `pointer-events:none`) follows the glide so
+  the person can see where it's going. No stop corner (the person's mouse isn't involved): Ctrl+C.
+- Headless: a live view at `http://localhost:8890` (next free port up to 8899) shows the page via
+  `Page.startScreencast`; the agent prints the address.
+- System prompt: the control-mode text with the browser intro (`...through the computer tools and
+  the browser tool. Screenshots are WxH pixels and show only the web page...`) and a hint that
+  browser shortcuts like ctrl+t don't work, so use the browser tool. Rules unchanged.
+
 ## Screen scaling
 
 - `W,H` = primary display size in the unit the input API uses (Windows: physical px with the

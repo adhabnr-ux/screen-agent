@@ -110,6 +110,10 @@ jobs:
         run: docker build -t screen-agent-linux-test -f test/linux_Dockerfile test
       - name: Run Linux tests (real XTest input on a virtual display)
         run: docker run --rm -v "$PWD":/src:ro screen-agent-linux-test bash /src/test/linux_test.sh
+      - name: Build browser-mode test image (Chromium)
+        run: docker build -t screen-agent-browser-test -f test/browser_Dockerfile test
+      - name: Run browser-mode tests (real Chromium; typing, drag, scroll, tabs, live view)
+        run: docker run --rm -v "$PWD":/src:ro screen-agent-browser-test bash /src/test/browser_test.sh
 
   macos:
     runs-on: macos-latest

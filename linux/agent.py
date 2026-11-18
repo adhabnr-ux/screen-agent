@@ -25,7 +25,10 @@ MODEL = os.environ.get("SCREEN_AGENT_MODEL", "claude-sonnet-5-5")
 EFFORT = os.environ.get("SCREEN_AGENT_EFFORT", "medium")
 DRY_RUN = os.environ.get("SCREEN_AGENT_DRY_RUN") == "1"
 TASK = os.environ.get("SCREEN_AGENT_TASK")
-GUIDE = os.environ.get("SCREEN_AGENT_MODE", "").strip().lower() == "guide"
+MODE = os.environ.get("SCREEN_AGENT_MODE", "").strip().lower()
+GUIDE = MODE == "guide"
+BROWSER = MODE == "browser"  # Claude drives its own Chromium window (linux/browser.py), not the desktop
+BROWSER_MOD = None  # set in main() when BROWSER
 FAST_DEFAULT = os.environ.get("SCREEN_AGENT_FAST") == "1"
 SMOOTH = os.environ.get("SCREEN_AGENT_SMOOTH") != "0"  # 0 = the pointer jumps instead of gliding
 
@@ -824,9 +827,11 @@ class GuideOnly(Exception):
     pass
 
 
-def err_result(tid, msg):
-    return {"type": "tool_result", "tool_use_id": tid, "toolset_name": "computer",
-            "is_error": True, "content": msg}
+def err_result(tid, msg, toolset="computer"):
+    r = {"type": "tool_result", "tool_use_id": tid, "is_error": True, "content": msg}
+    if toolset:  # only results for toolset members carry toolset_name; the custom browser tool's don't
+        r["toolset_name"] = toolset
+    return r
 
 
 class Agent:
@@ -838,8 +843,12 @@ class Agent:
         self.task_text = None
         self.last_body_len = 0
         self.fast = FAST_DEFAULT
-        intro = (SYSTEM_INTRO_GUIDE if GUIDE else SYSTEM_INTRO).format(os="Linux", sw=screen.sw, sh=screen.sh)
-        how = SYSTEM_HOW_GUIDE if GUIDE else SYSTEM_HOW.replace("{hint}", OS_HINT)
+        if BROWSER:
+            intro = BROWSER_MOD.BROWSER_INTRO.format(sw=screen.sw, sh=screen.sh)
+            how = SYSTEM_HOW.replace("{hint}", BROWSER_MOD.BROWSER_HINT)
+        else:
+            intro = (SYSTEM_INTRO_GUIDE if GUIDE else SYSTEM_INTRO).format(os="Linux", sw=screen.sw, sh=screen.sh)
+            how = SYSTEM_HOW_GUIDE if GUIDE else SYSTEM_HOW.replace("{hint}", OS_HINT)
         self.system = intro + "\n\n" + how + "\n\n" + SYSTEM_RULES
 
     # ---- API
@@ -848,7 +857,8 @@ class Agent:
         b = {"model": MODEL, "max_tokens": 16000, "system": self.system,
              "thinking": {"type": "adaptive", "display": "updates"},
              "output_config": {"effort": EFFORT},
-             "tools": [TOOLSET_GUIDE if GUIDE else {"type": "computer_toolset_20260801"}],
+             "tools": [TOOLSET_GUIDE if GUIDE else {"type": "computer_toolset_20260801"}] +
+                      ([BROWSER_MOD.BROWSER_TOOL] if BROWSER else []),
              "fallbacks": "default",
              "cache_control": {"type": "ephemeral"},
              "messages": self.messages}
@@ -933,6 +943,8 @@ class Agent:
     # ---- tools
 
     def failsafe(self):
+        if BROWSER:  # the person's own mouse isn't involved; Ctrl+C stops instead
+            return False
         x, y = self.sc.cursor()
         return x <= 2 and y <= 2
 
@@ -984,6 +996,11 @@ class Agent:
             self.log(name, inp)
             time.sleep(min(300.0, max(0.0, float(inp.get("duration", 1)))))
             return [{"type": "text", "text": "OK"}]
+        if name == "browser":
+            if not BROWSER:
+                raise Unsupported()
+            self.log(name, inp, "")
+            return [{"type": "text", "text": sc.browser_action(inp)}]
         if name not in INPUT_ACTIONS:
             raise Unsupported()
         if GUIDE:
@@ -1047,42 +1064,45 @@ class Agent:
         results, failed, stopped = [], False, False
         for b in uses:
             tid, name, inp = b["id"], b.get("name"), b.get("input") or {}
+            ts = b.get("toolset_name")  # echoed back only for toolset members
             if stopped:
-                results.append(err_result(tid, STOP_MSG))
+                results.append(err_result(tid, STOP_MSG, ts))
                 continue
             if failed:
-                results.append(err_result(tid, NOT_RUN_MSG))
+                results.append(err_result(tid, NOT_RUN_MSG, ts))
                 continue
             if not GUIDE and name in INPUT_ACTIONS and self.failsafe():
                 stopped = True
                 say("Stopped (mouse in top-left corner)")
-                results.append(err_result(tid, STOP_MSG))
+                results.append(err_result(tid, STOP_MSG, ts))
                 continue
             try:
                 content = self.do(name, inp)
-                results.append({"type": "tool_result", "tool_use_id": tid, "toolset_name": "computer",
-                                "content": content})
+                r = {"type": "tool_result", "tool_use_id": tid, "content": content}
+                if ts:
+                    r["toolset_name"] = ts
+                results.append(r)
             except Unsupported:
                 failed = True
                 say("  → %s (not supported)" % name)
-                results.append(err_result(tid, "Not supported on this computer."))
+                results.append(err_result(tid, "Not supported on this computer.", ts))
             except Stopped:  # stop corner reached in the middle of typing: same as the failsafe
                 stopped = True
                 say("Stopped (mouse in top-left corner)")
-                results.append(err_result(tid, STOP_MSG))
+                results.append(err_result(tid, STOP_MSG, ts))
                 self.sc.release_all()
             except GuideOnly:
                 failed = True
                 say("  → %s (not available in guide mode)" % name)
-                results.append(err_result(tid, GUIDE_MSG))
+                results.append(err_result(tid, GUIDE_MSG, ts))
             except Exception as e:  # noqa: BLE001 - report any failure to the model
                 failed = True
                 say("  ! %s failed: %s" % (name, e))
-                results.append(err_result(tid, "Error: %s" % e))
+                results.append(err_result(tid, "Error: %s" % e, ts))
                 self.sc.release_all()
         # Automatic screenshot: saves the round trip Claude would spend asking for one.
         if (not GUIDE and uses and not failed and not stopped and uses[-1].get("name") != "screenshot"
-                and any(u.get("name") in INPUT_ACTIONS or u.get("name") == "wait" for u in uses)):
+                and any(u.get("name") in INPUT_ACTIONS or u.get("name") in ("wait", "browser") for u in uses)):
             try:
                 time.sleep(AUTO_SHOT_SETTLE)
                 shot = self.image(self.sc.screenshot())
@@ -1167,6 +1187,7 @@ def ask_yes(prompt):
         return False
 
 
+HELP_BROWSER_STOP = "To stop Claude mid-task, press Ctrl+C."
 HELP = """Commands:
   /new   start a fresh conversation
   /key   enter a different API key
@@ -1176,12 +1197,33 @@ HELP = """Commands:
 Anything else is a request for Claude, e.g. "open the calculator and add 12 and 30"."""
 
 
+def start_browser():
+    """Loads linux/browser.py (next to this file) and opens Claude's Chromium window."""
+    global BROWSER_MOD
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import browser as mod
+    except ImportError:
+        fatal("Browser mode needs browser.py next to agent.py. Run the Screen Agent command again to fetch it.")
+    BROWSER_MOD = mod
+    shared = {"glide_path": glide_path, "drag_duration": drag_duration, "straight_path": straight_path,
+              "Stopped": Stopped, "SMOOTH": SMOOTH, "TYPE_CHECK_EVERY": TYPE_CHECK_EVERY}
+    try:
+        return mod.BrowserScreen(shared, say, dim)
+    except mod.BrowserError as e:
+        fatal(str(e))
+
+
 def main():
-    screen = Screen()
+    screen = None if BROWSER else Screen()
     key = get_key()
     load_workspace()
     startup_check(key)
-    if GUIDE:
+    if BROWSER:
+        screen = start_browser()
+        say(bold("Screen Agent (browser mode): Claude works in its own Chromium %s. Press Ctrl+C to stop."
+                 % ("window, out of sight" if screen.headless else "window")))
+    elif GUIDE:
         say(bold("Screen Agent (guide mode) — Claude can see the screen and tells you what to do. "
                  "It can't click or type here."))
     else:
@@ -1190,12 +1232,17 @@ def main():
     if DRY_RUN and not GUIDE:
         say(dim("(Dry run: no mouse or keyboard input will be sent.)"))
     agent = Agent(screen, key)
-    say(dim("Model %s · screen %dx%d → screenshots %dx%d" % (MODEL, screen.W, screen.H, screen.sw, screen.sh)))
+    if BROWSER:
+        say(dim("Model %s · browser page %dx%d" % (MODEL, screen.sw, screen.sh)))
+    else:
+        say(dim("Model %s · screen %dx%d → screenshots %dx%d" % (MODEL, screen.W, screen.H, screen.sw, screen.sh)))
     try:
         if TASK:
             ok = agent.run_task(TASK)
             sys.exit(0 if ok else 1)
         say(HELP)
+        if BROWSER:
+            say(HELP_BROWSER_STOP)
         while True:
             try:
                 text = input("\nWhat should I do? > ").strip()
@@ -1209,6 +1256,8 @@ def main():
                 break
             if cmd == "/help":
                 say(HELP)
+                if BROWSER:
+                    say(HELP_BROWSER_STOP)
                 continue
             if cmd == "/new":
                 agent.messages, agent.task_text = [], None
@@ -1230,6 +1279,8 @@ def main():
         say("\nStopped.")
     finally:
         screen.release_all()
+        if BROWSER:
+            screen.close()
 
 
 if __name__ == "__main__":

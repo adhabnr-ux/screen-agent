@@ -1,0 +1,4 @@
+# Test-only image for browser mode: python3 + Chromium + curl. Nothing here ships to users.
+FROM debian:stable-slim
+RUN apt-get update && apt-get install -y --no-install-recommends python3 chromium curl ca-certificates fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*

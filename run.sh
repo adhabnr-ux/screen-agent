@@ -6,12 +6,20 @@
 #
 # Run in this window instead of opening a new one:
 #   curl -fsSL https://raw.githubusercontent.com/adhabnr-ux/screen-agent/main/run.sh | bash -s -- --here
+#
+# Browser mode (Claude drives its own Chromium window instead of the desktop). It starts on its own
+# in a Chromebook's Linux container, in GitHub Codespaces, and wherever there's no desktop:
+#   curl -fsSL https://raw.githubusercontent.com/adhabnr-ux/screen-agent/main/run.sh | bash -s -- --browser
 set -u
 
 RAW="${SCREEN_AGENT_REPO_RAW:-https://raw.githubusercontent.com/adhabnr-ux/screen-agent/main}"
 DIR="$HOME/.screen-agent"
 HERE=0
-for arg in "$@"; do [ "$arg" = "--here" ] && HERE=1; done
+BROWSER=0
+for arg in "$@"; do
+  [ "$arg" = "--here" ] && HERE=1
+  [ "$arg" = "--browser" ] && BROWSER=1
+done
 
 say() { printf '%s\n' "$*"; }
 die() { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
@@ -55,7 +63,18 @@ case "$(uname -s)" in
     PY=$(command -v python3 || true)
     [ -n "$PY" ] || die "Screen Agent needs python3, which this Linux system doesn't have."
     fetch linux/agent.py agent.py
-    if [ "$HERE" = 1 ] || [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then run_here "$PY" "$DIR/agent.py"; fi
+    fetch linux/browser.py browser.py
+    # Where the desktop can't be controlled, use browser mode: a Chromebook's Linux container
+    # (ChromeOS keeps its own screen to itself), GitHub Codespaces, or no desktop at all.
+    if [ -e /dev/.cros_milestone ] || [ -d /opt/google/cros-containers ] || [ "${CODESPACES:-}" = "true" ] \
+       || [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+      BROWSER=1
+    fi
+    if [ "$BROWSER" = 1 ]; then
+      export SCREEN_AGENT_MODE=browser
+      run_here "$PY" "$DIR/agent.py"
+    fi
+    if [ "$HERE" = 1 ]; then run_here "$PY" "$DIR/agent.py"; fi
     INNER=". \"\$HOME/.screen-agent/env\" 2>/dev/null; \"$PY\" \"\$HOME/.screen-agent/agent.py\"; echo; read -rp 'Press Return to close this window.' _"
     opened=0
     for t in x-terminal-emulator gnome-terminal konsole xfce4-terminal mate-terminal lxterminal tilix kitty alacritty xterm; do

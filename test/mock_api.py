@@ -14,6 +14,8 @@ Options via env:
                        {"name": ..., "input": {...}} computer actions; after the last turn the mock ends.
                        Results are checked only generically (pairing, toolset_name); "action_errors" in the
                        report counts tool results that came back with is_error.
+                       A turn may also call the custom "browser" tool (browser mode). Text results of
+                       every tool_result are kept in the report's "result_texts" for tests to check.
   MOCK_REJECT_SPEED=1  reply 400 to any request with "speed" in the body (tests the fast-mode fallback)
   MOCK_UNSCOPED=1      the key is organization-wide: requests need anthropic-workspace-id
                        (wrkspc_01TESTDEFAULT or wrkspc_01TESTSECOND); /v1/organizations/workspaces lists both
@@ -43,7 +45,7 @@ NEED_WS = {"type": "error", "error": {"type": "invalid_request_error", "message"
 REPORT = os.environ.get("MOCK_REPORT", "mock_report.json")
 INPUT_MEMBERS = ["left_click", "right_click", "middle_click", "double_click", "triple_click", "left_click_drag",
                  "mouse_move", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key"]
-state = {"action_errors": [], "guide": False, "speed": None, "speed_rejected": False, "workspace_seen": None, "calls": 0, "step": 0, "errors": [], "checks": [], "saw_429": False,
+state = {"browser_mode": False, "result_texts": [], "action_errors": [], "guide": False, "speed": None, "speed_rejected": False, "workspace_seen": None, "calls": 0, "step": 0, "errors": [], "checks": [], "saw_429": False,
          "compat": False, "done": False, "image_sizes": []}
 
 
@@ -75,9 +77,14 @@ def image_size(b64, media):
     raise ValueError("unsupported media " + media)
 
 
+CUSTOM_TOOLS = {"browser"}  # user-defined tools: their tool_use blocks carry no toolset_name
+
+
 def tu(i, name, inp):
-    return {"type": "tool_use", "id": f"toolu_{state['step']}_{i}", "name": name,
-            "toolset_name": "computer", "input": inp}
+    b = {"type": "tool_use", "id": f"toolu_{state['step']}_{i}", "name": name, "input": inp}
+    if name not in CUSTOM_TOOLS:
+        b["toolset_name"] = "computer"
+    return b
 
 
 SIG = "c2lnbmF0dXJl"  # fake signature, must be echoed back unchanged
@@ -140,9 +147,15 @@ def validate(body, headers):
     check(body.get("model"), "model set")
     check(body.get("max_tokens", 0) >= 1024, "max_tokens >= 1024")
     tools = body.get("tools")
-    ok_tools = isinstance(tools, list) and len(tools) == 1 and tools[0].get("type") == "computer_toolset_20260801" \
-        and set(tools[0]) <= {"type", "configs"}
-    check(ok_tools, "tools is exactly the computer toolset")
+    extra = tools[1:] if isinstance(tools, list) else []
+    browser_tool = len(extra) == 1 and extra[0].get("name") == "browser" and "type" not in extra[0] \
+        and extra[0].get("input_schema", {}).get("type") == "object" \
+        and "action" in extra[0]["input_schema"].get("required", [])
+    if browser_tool:
+        state["browser_mode"] = True
+    ok_tools = isinstance(tools, list) and len(tools) in (1, 2) and tools[0].get("type") == "computer_toolset_20260801" \
+        and set(tools[0]) <= {"type", "configs"} and (len(tools) == 1 or browser_tool)
+    check(ok_tools, "tools is the computer toolset (plus the browser tool in browser mode)")
     if ok_tools and "configs" in tools[0]:
         cfg = tools[0]["configs"]
         state["guide"] = True
@@ -175,8 +188,13 @@ def validate(body, headers):
         results = [b for b in msgs[i + 1]["content"] if isinstance(b, dict) and b.get("type") == "tool_result"]
         ids = [r["tool_use_id"] for r in results]
         check(ids == [u["id"] for u in uses], f"msg {i}: one tool_result per tool_use, in order")
+        by_id = {u["id"]: u for u in uses}
         for r in results:
-            check(r.get("toolset_name") == "computer", f"{r['tool_use_id']}: toolset_name echoed")
+            u = by_id.get(r["tool_use_id"], {})
+            if u.get("toolset_name"):
+                check(r.get("toolset_name") == u["toolset_name"], f"{r['tool_use_id']}: toolset_name echoed")
+            else:
+                check("toolset_name" not in r, f"{r['tool_use_id']}: no toolset_name on a custom tool's result")
         # thinking blocks echoed unchanged
         for b in m["content"]:
             if b.get("type") == "thinking":
@@ -332,8 +350,13 @@ class H(BaseHTTPRequestHandler):
         if CUSTOM is not None:
             last = msgs[-1]["content"] if msgs and msgs[-1]["role"] == "user" else []
             for r in last:
-                if isinstance(r, dict) and r.get("type") == "tool_result" and r.get("is_error"):
-                    state["action_errors"].append(str(r.get("content"))[:200])
+                if isinstance(r, dict) and r.get("type") == "tool_result":
+                    if r.get("is_error"):
+                        state["action_errors"].append(str(r.get("content"))[:200])
+                    c = r.get("content")
+                    for blk in (c if isinstance(c, list) else [{"type": "text", "text": c}]):
+                        if isinstance(blk, dict) and blk.get("type") == "text":
+                            state["result_texts"].append(blk.get("text", ""))
         elif state["step"] > 0:
             check_results(msgs)
         content, stop = script(state["step"])
@@ -362,7 +385,8 @@ def write_report():
                    "passed": len(state["checks"]), "saw_429": state["saw_429"],
                    "compat": state["compat"], "workspace": state["workspace_seen"], "guide": state["guide"], "speed": state["speed"],
                    "speed_rejected": state["speed_rejected"], "action_errors": state["action_errors"],
-                   "custom": CUSTOM is not None, "image_sizes": state["image_sizes"]}, f, indent=1)
+                   "custom": CUSTOM is not None, "browser_mode": state["browser_mode"],
+                   "result_texts": state["result_texts"], "image_sizes": state["image_sizes"]}, f, indent=1)
 
 
 if __name__ == "__main__":

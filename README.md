@@ -73,6 +73,25 @@ which setting is blocked and who can change it (usually IT), then stops.
 
 To start in guide mode on purpose, set `SCREEN_AGENT_MODE=guide` before running the command.
 
+## Chromebooks and VS Code (browser mode)
+
+A Chromebook doesn't let any program control its screen, but its Linux container can run a
+browser that Claude controls. That's how the Cline extension's browser works, and Screen Agent
+does the same. Open the terminal in VS Code (or the Linux Terminal app) and run the macOS/Linux
+command. On a Chromebook or in GitHub Codespaces it switches to browser mode by itself:
+
+- Claude opens its own Chromium window and works inside it: opening sites, clicking, typing,
+  dragging, scrolling and switching tabs. It can't touch your other windows or your own Chrome
+  tabs.
+- It uses the Chromium that Cline already downloaded, so nothing new is installed. If it can't
+  find one, ask Cline to open any web page with its browser once, then run the command again.
+- If the window can't be shown (for example in Codespaces), the agent prints a live-view address
+  such as `http://localhost:8890` so you can watch.
+- It's a fresh browser: you're not signed in to anything there until you sign in yourself.
+
+To use browser mode anywhere on Linux, add `--browser`:
+`curl -fsSL …/run.sh | bash -s -- --browser`.
+
 ## Per-computer requirements
 
 | | What's needed | When it won't work |
@@ -80,7 +99,7 @@ To start in guide mode on purpose, set `SCREEN_AGENT_MODE=guide` before running 
 | **Windows** 10/11 | PowerShell (built in). No permission prompts. | A device policy that puts PowerShell in Constrained Language Mode: the agent says so and stops. If policy blocks only the mouse-and-keyboard part, it continues in guide mode. |
 | **macOS** 10.15+ | One-time permission: System Settings → Privacy & Security → **Screen & System Audio Recording** (to see) and **Accessibility** (to click and type) → turn on Terminal. | On a managed Mac where only an administrator can change those settings. With Screen Recording but no Accessibility, it runs in guide mode. |
 | **Linux** | Python 3 and an X11 desktop session (most distros ship both) | Wayland sessions block synthetic input: choose "Xorg"/"X11" at the login screen. |
-| **Chromebook** | – | No terminal, so it can't run. |
+| **Chromebook** | Linux (Crostini) or VS Code with a terminal | Browser mode only (see above). Without Linux turned on there's no terminal, so it can't run. |
 
 Only the main display is used. The screenshots sent to Claude are scaled to fit 1280×800.
 
